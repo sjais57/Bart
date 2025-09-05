@@ -1,0 +1,287 @@
+import requests
+import json
+import getpass
+import os
+import time
+from typing import Dict, List, Optional, Any, Union
+from urllib3.exceptions import InsecureRequestWarning
+from datetime import datetime
+
+# Suppress SSL warnings
+requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
+
+class SessionManager:
+    def __init__(self, base_url: str = "https://url", token_file: str = "tokens.json"):
+        self.base_url = base_url.rstrip('/')
+        self.token_file = token_file
+        self.token = None
+        self.script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.token_path = os.path.join(self.script_dir, self.token_file)
+        
+    def get_token(self, user_id: Optional[str] = None) -> Optional[str]:
+        """Get token from tokens.json for the given user or current user"""
+        if user_id is None:
+            user_id = getpass.getuser()
+            
+        try:
+            with open(self.token_path, 'r', encoding='utf-8') as f:
+                tokens = json.load(f)
+                self.token = tokens.get(user_id)
+                return self.token
+        except FileNotFoundError:
+            print(f"Token file '{self.token_file}' not found in: {self.script_dir}")
+            return None
+        except json.JSONDecodeError:
+            print(f"Error parsing JSON file '{self.token_file}'")
+            return None
+        except Exception as e:
+            print(f"Unexpected error reading token file: {e}")
+            return None
+
+    def list_available_users(self) -> List[str]:
+        """List all available users in the tokens file"""
+        try:
+            with open(self.token_path, 'r', encoding='utf-8') as f:
+                tokens = json.load(f)
+                return list(tokens.keys())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+
+    def _make_request(self, endpoint: str, method: str = "GET", 
+                     payload: Optional[Dict] = None, 
+                     timeout: int = 30) -> Optional[Dict]:
+        """Internal method to make API requests"""
+        if not self.token:
+            raise ValueError("No token available. Call get_token() first.")
+            
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {self.token}'
+        }
+        
+        url = f"{self.base_url}{endpoint}"
+        
+        try:
+            if method.upper() == "POST":
+                response = requests.post(url, headers=headers, json=payload, 
+                                       verify=False, timeout=timeout)
+            elif method.upper() == "DELETE":
+                response = requests.delete(url, headers=headers, 
+                                         verify=False, timeout=timeout)
+            elif method.upper() == "PUT":
+                response = requests.put(url, headers=headers, json=payload,
+                                      verify=False, timeout=timeout)
+            else:
+                response = requests.get(url, headers=headers, 
+                                      verify=False, timeout=timeout)
+                
+            response.raise_for_status()
+            return response.json()
+            
+        except requests.exceptions.Timeout:
+            print(f"Request timed out after {timeout} seconds")
+            return None
+        except requests.exceptions.ConnectionError:
+            print(f"Connection error. Please check the base URL: {self.base_url}")
+            return None
+        except requests.exceptions.HTTPError as e:
+            print(f"HTTP error {e.response.status_code}: {e}")
+            return None
+        except requests.exceptions.RequestException as e:
+            print(f"Request failed: {e}")
+            return None
+        except json.JSONDecodeError:
+            print(f"Failed to parse JSON response from {endpoint}")
+            return None
+
+    def launch_session(self, session_name: str = "My JupyterLab Session-1", 
+                      workbench: str = "JupyterLab", cluster: str = "Local",
+                      wait_for_ready: bool = False, timeout: int = 300) -> Optional[str]:
+        """Launch a new session with optional waiting for readiness"""
+        user_id = getpass.getuser()
+        payload = {
+            "method": "launch_session",
+            "kwparams": {
+                "workbench": workbench,
+                "name": session_name,
+                "launch_parameters": {
+                    "name": f"{user_id}-JL3",
+                    "cluster": cluster,
+                    "placement_constraints": [],
+                    "resource_limits": [],
+                    "queues": []
+                }
+            }
+        }
+        
+        response = self._make_request("/api/launch_session", "POST", payload)
+        if not response or "result" not in response:
+            return None
+            
+        session_data = response["result"]
+        
+        if "url" in session_data:
+            session_url = f"{self.base_url}{session_data['url']}"
+            
+            if wait_for_ready and "session_id" in session_data:
+                if self._wait_for_session_ready(session_data["session_id"], timeout):
+                    print("Session is ready!")
+                else:
+                    print("Session launch timed out or failed")
+                    
+            return session_url
+            
+        return None
+
+    def _wait_for_session_ready(self, session_id: str, timeout: int = 300) -> bool:
+        """Wait for session to become ready"""
+        start_time = time.time()
+        print("Waiting for session to become ready...", end="", flush=True)
+        
+        while time.time() - start_time < timeout:
+            session_info = self.get_session(session_id)
+            if session_info and session_info.get("status") == "ready":
+                print(" done!")
+                return True
+            elif session_info and session_info.get("status") in ["failed", "error"]:
+                print(f" failed with status: {session_info.get('status')}")
+                return False
+                
+            print(".", end="", flush=True)
+            time.sleep(5)
+            
+        print(" timeout!")
+        return False
+
+    def list_sessions(self) -> Optional[Dict]:
+        """Get list of all active sessions"""
+        return self._make_request("/api/sessions")
+
+    def get_session(self, session_id: str) -> Optional[Dict]:
+        """Get details of a specific session"""
+        return self._make_request(f"/api/sessions/{session_id}")
+
+    def kill_session(self, session_id: str) -> bool:
+        """Terminate a specific session"""
+        response = self._make_request(f"/api/sessions/{session_id}", "DELETE")
+        return response is not None and response.get("success", False)
+
+    def kill_all_user_sessions(self, user_id: Optional[str] = None) -> int:
+        """Terminate all sessions for a specific user"""
+        if user_id is None:
+            user_id = getpass.getuser()
+            
+        user_sessions = self.get_sessions_by_user(user_id)
+        killed_count = 0
+        
+        for session in user_sessions:
+            if self.kill_session(session.get("id")):
+                killed_count += 1
+                
+        return killed_count
+
+    def get_sessions_by_user(self, user_id: Optional[str] = None) -> List[Dict]:
+        """Get sessions for a specific user"""
+        if user_id is None:
+            user_id = getpass.getuser()
+            
+        sessions = self.list_sessions()
+        if sessions and "result" in sessions:
+            return [session for session in sessions["result"] 
+                   if session.get("user") == user_id]
+        return []
+
+    def get_session_stats(self) -> Dict[str, Any]:
+        """Get statistics about all sessions"""
+        sessions = self.list_sessions()
+        if not sessions or "result" not in sessions:
+            return {}
+            
+        all_sessions = sessions["result"]
+        stats = {
+            "total_sessions": len(all_sessions),
+            "by_status": {},
+            "by_user": {},
+            "by_workbench": {}
+        }
+        
+        for session in all_sessions:
+            # Count by status
+            status = session.get("status", "unknown")
+            stats["by_status"][status] = stats["by_status"].get(status, 0) + 1
+            
+            # Count by user
+            user = session.get("user", "unknown")
+            stats["by_user"][user] = stats["by_user"].get(user, 0) + 1
+            
+            # Count by workbench type
+            workbench = session.get("workbench", "unknown")
+            stats["by_workbench"][workbench] = stats["by_workbench"].get(workbench, 0) + 1
+            
+        return stats
+
+# Example usage functions
+def main():
+    # Create session manager instance
+    sm = SessionManager(base_url="https://your-api-url.com")
+    
+    # Get token for current user
+    if not sm.get_token():
+        print("Token not found! Available users:")
+        for user in sm.list_available_users():
+            print(f"  - {user}")
+        return
+    
+    # Example 1: Launch a session and wait for it to be ready
+    print("Launching new session...")
+    session_url = sm.launch_session(
+        session_name="My Test Session", 
+        wait_for_ready=True,
+        timeout=120
+    )
+    
+    if session_url:
+        print(f"Session launched: {session_url}")
+    
+    # Example 2: List all sessions with statistics
+    print("\nSession Statistics:")
+    stats = sm.get_session_stats()
+    print(f"Total sessions: {stats.get('total_sessions', 0)}")
+    print("By status:", stats.get('by_status', {}))
+    
+    # Example 3: Get sessions for current user
+    user_sessions = sm.get_sessions_by_user()
+    print(f"\nYour active sessions: {len(user_sessions)}")
+    for i, session in enumerate(user_sessions, 1):
+        print(f"{i}. {session.get('name')} - {session.get('status')}")
+
+    # Example 4: Kill all user sessions (commented out for safety)
+    # killed = sm.kill_all_user_sessions()
+    # print(f"Killed {killed} sessions")
+
+# Utility functions for direct import
+def launch_new_session(session_name: str = "My Session", 
+                      user_id: Optional[str] = None,
+                      wait_for_ready: bool = True) -> Optional[str]:
+    """Convenience function to quickly launch a session"""
+    sm = SessionManager()
+    if sm.get_token(user_id):
+        return sm.launch_session(session_name, wait_for_ready=wait_for_ready)
+    return None
+
+def get_user_sessions(user_id: Optional[str] = None) -> List[Dict]:
+    """Convenience function to get user sessions"""
+    sm = SessionManager()
+    if sm.get_token(user_id):
+        return sm.get_sessions_by_user(user_id)
+    return []
+
+def cleanup_user_sessions(user_id: Optional[str] = None) -> int:
+    """Convenience function to cleanup all user sessions"""
+    sm = SessionManager()
+    if sm.get_token(user_id):
+        return sm.kill_all_user_sessions(user_id)
+    return 0
+
+if __name__ == "__main__":
+    main()
