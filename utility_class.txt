@@ -1,0 +1,140 @@
+import requests
+import json
+import getpass
+import os
+
+class SessionManager:
+    def __init__(self, base_url="https://url", token_file="tokens.json"):
+        self.base_url = base_url
+        self.token_file = token_file
+        self.token = None
+        
+    def get_token(self, user_id=None):
+        """Get token from tokens.json for the given user or current user"""
+        if user_id is None:
+            user_id = getpass.getuser()
+            
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            token_path = os.path.join(script_dir, self.token_file)
+            
+            with open(token_path, 'r') as f:
+                tokens = json.load(f)
+                self.token = tokens.get(user_id)
+                return self.token
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+
+    def _make_request(self, endpoint, method="GET", payload=None):
+        """Internal method to make API requests"""
+        if not self.token:
+            raise ValueError("No token available. Call get_token() first.")
+            
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {self.token}'
+        }
+        
+        url = f"{self.base_url}{endpoint}"
+        
+        try:
+            if method.upper() == "POST":
+                response = requests.post(url, headers=headers, json=payload, verify=False)
+            else:
+                response = requests.get(url, headers=headers, verify=False)
+                
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            print(f"API request failed: {e}")
+            return None
+
+    def launch_session(self, session_name="My JupyterLab Session-1", 
+                      workbench="JupyterLab", cluster="Local"):
+        """Launch a new session"""
+        user_id = getpass.getuser()
+        payload = {
+            "method": "launch_session",
+            "kwparams": {
+                "workbench": workbench,
+                "name": session_name,
+                "launch_parameters": {
+                    "name": f"{user_id}-JL3",
+                    "cluster": cluster,
+                    "placement_constraints": [],
+                    "resource_limits": [],
+                    "queues": []
+                }
+            }
+        }
+        
+        response = self._make_request("/api/launch_session", "POST", payload)
+        if response and "result" in response and "url" in response["result"]:
+            return f"{self.base_url}{response['result']['url']}"
+        return None
+
+    def list_sessions(self):
+        """Get list of all active sessions"""
+        return self._make_request("/api/sessions")
+
+    def get_session(self, session_id):
+        """Get details of a specific session"""
+        return self._make_request(f"/api/sessions/{session_id}")
+
+    def kill_session(self, session_id):
+        """Terminate a specific session"""
+        return self._make_request(f"/api/sessions/{session_id}", "DELETE")
+
+    def get_sessions_by_user(self, user_id=None):
+        """Get sessions for a specific user"""
+        if user_id is None:
+            user_id = getpass.getuser()
+            
+        sessions = self.list_sessions()
+        if sessions and "result" in sessions:
+            return [session for session in sessions["result"] if session.get("user") == user_id]
+        return []
+
+# Example usage functions
+def main():
+    # Create session manager instance
+    sm = SessionManager(base_url="https://your-api-url.com")
+    
+    # Get token for current user
+    if not sm.get_token():
+        print("Token not found!")
+        return
+    
+    # Example 1: Launch a session
+    session_url = sm.launch_session("My Test Session")
+    if session_url:
+        print(f"Session launched: {session_url}")
+    
+    # Example 2: List all sessions
+    sessions = sm.list_sessions()
+    print("All sessions:", json.dumps(sessions, indent=2))
+    
+    # Example 3: Get sessions for current user
+    user_sessions = sm.get_sessions_by_user()
+    print(f"Your sessions: {len(user_sessions)}")
+    
+    # Example 4: Kill a session (if you have session IDs)
+    # sm.kill_session("session-id-123")
+
+# Utility functions for direct import
+def launch_new_session(session_name="My Session", user_id=None):
+    """Convenience function to quickly launch a session"""
+    sm = SessionManager()
+    if sm.get_token(user_id):
+        return sm.launch_session(session_name)
+    return None
+
+def get_user_sessions(user_id=None):
+    """Convenience function to get user sessions"""
+    sm = SessionManager()
+    if sm.get_token(user_id):
+        return sm.get_sessions_by_user(user_id)
+    return []
+
+if __name__ == "__main__":
+    main()
