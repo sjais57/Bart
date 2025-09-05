@@ -20,58 +20,108 @@ def get_token_from_json(user_id, filename="tokens.json"):
         print(f"Error parsing JSON file '{filename}'")
         return None
 
-# Automatically get the current system username
-current_user = getpass.getuser()
-print(f"Detected user: {current_user}")
-
-# Configuration
-base_url = "https://url"
-launch_api = "/api/launch_session"
-
-# Get token from JSON file based on current user
-token = get_token_from_json(current_user)
-if not token:
-    print(f"Token not found for user: {current_user}")
-    print("Available users in tokens.json:")
-    try:
-        # Get the directory where the script is located
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        token_file_path = os.path.join(script_dir, "tokens.json")
-        
-        with open(token_file_path, 'r') as file:
-            tokens = json.load(file)
-            for user in tokens.keys():
-                print(f"  - {user}")
-    except FileNotFoundError:
-        print("  tokens.json file not found in the script directory")
-    except json.JSONDecodeError:
-        print("  Error reading tokens.json file")
-    except Exception as e:
-        print(f"  Unexpected error: {e}")
-    exit(1)
-
-payload = json.dumps({
-    "method": "launch_session",
-    "kwparams": {
-        "workbench": "JupyterLab",
-        "name": "My JupyterLab Session-1",
-        "launch_parameters": {
-            "name": f"{current_user}-JL3",
-            "cluster": "Local",
-            "placement_constraints": [],
-            "resource_limits": [],
-            "queues": []
+def launch_session(base_url, api_endpoint, token, session_name="My JupyterLab Session-1", workbench="JupyterLab", cluster="Local"):
+    """
+    Launch a session using the provided API
+    
+    Args:
+        base_url (str): The base URL of the API
+        api_endpoint (str): The API endpoint for launching sessions
+        token (str): Authentication token
+        session_name (str): Name for the session
+        workbench (str): Type of workbench to launch
+        cluster (str): Cluster to use for the session
+    
+    Returns:
+        dict: Response data from the API or None if failed
+    """
+    payload = json.dumps({
+        "method": "launch_session",
+        "kwparams": {
+            "workbench": workbench,
+            "name": session_name,
+            "launch_parameters": {
+                "name": f"{getpass.getuser()}-JL3",
+                "cluster": cluster,
+                "placement_constraints": [],
+                "resource_limits": [],
+                "queues": []
+            }
         }
+    })
+
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {token}'
     }
-})
 
-headers = {
-    'Content-Type': 'application/json',
-    'Authorization': f'Bearer {token}'
-}
+    try:
+        response = requests.request("POST", base_url + api_endpoint, headers=headers, data=payload, verify=False)
+        response.raise_for_status()  # Raise exception for bad status codes
+        
+        data_dict = json.loads(response.text)
+        return data_dict
+        
+    except requests.exceptions.RequestException as e:
+        print(f"Request failed: {e}")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"Failed to parse response JSON: {e}")
+        return None
 
-response = requests.request("POST", base_url + launch_api, headers=headers, data=payload, verify=False)
+def main():
+    """Main function to execute the session launch"""
+    # Automatically get the current system username
+    current_user = getpass.getuser()
+    print(f"Detected user: {current_user}")
 
-data_dict = json.loads(response.text)
-full_url = base_url + data_dict["result"]["url"]
-print(full_url)
+    # Configuration
+    base_url = "https://url"
+    launch_api = "/api/launch_session"
+
+    # Get token from JSON file based on current user
+    token = get_token_from_json(current_user)
+    if not token:
+        print(f"Token not found for user: {current_user}")
+        print("Available users in tokens.json:")
+        try:
+            # Get the directory where the script is located
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            token_file_path = os.path.join(script_dir, "tokens.json")
+            
+            with open(token_file_path, 'r') as file:
+                tokens = json.load(file)
+                for user in tokens.keys():
+                    print(f"  - {user}")
+        except FileNotFoundError:
+            print("  tokens.json file not found in the script directory")
+        except json.JSONDecodeError:
+            print("  Error reading tokens.json file")
+        except Exception as e:
+            print(f"  Unexpected error: {e}")
+        exit(1)
+
+    # Launch the session using the function
+    response_data = launch_session(
+        base_url=base_url,
+        api_endpoint=launch_api,
+        token=token,
+        session_name="My JupyterLab Session-1",
+        workbench="JupyterLab",
+        cluster="Local"
+    )
+
+    if response_data:
+        # Check if the response contains the expected result
+        if "result" in response_data and "url" in response_data["result"]:
+            full_url = base_url + response_data["result"]["url"]
+            print(f"Session launched successfully!")
+            print(f"Session URL: {full_url}")
+        else:
+            print("Unexpected response format:")
+            print(json.dumps(response_data, indent=2))
+    else:
+        print("Failed to launch session")
+
+if __name__ == "__main__":
+    main()
