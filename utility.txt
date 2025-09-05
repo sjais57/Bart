@@ -1,0 +1,77 @@
+import requests, json, getpass, os
+
+
+# ----------------- TOKEN MANAGEMENT -----------------
+def get_token_from_json(user_id, filename="tokens.json"):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    token_file_path = os.path.join(script_dir, filename)
+    try:
+        with open(token_file_path, "r") as file:
+            tokens = json.load(file)
+            return tokens.get(user_id)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        print(f"❌ Token error: {e}")
+        return None
+
+
+# ----------------- API CALL HELPER -----------------
+def _make_request(method, url, token, payload=None):
+    headers = {"Content-Type": "application/json",
+               "Authorization": f"Bearer {token}"}
+    try:
+        r = requests.request(method, url, headers=headers,
+                             data=json.dumps(payload) if payload else None,
+                             verify=False)
+        r.raise_for_status()
+        return r.json()
+    except requests.RequestException as e:
+        print(f"❌ Request failed: {e}")
+    except json.JSONDecodeError:
+        print(f"❌ Failed to parse JSON from {url}")
+    return None
+
+
+# ----------------- SESSION FUNCTIONS -----------------
+def launch_session(base_url, token,
+                   session_name="My JupyterLab Session-1",
+                   workbench="JupyterLab", cluster="Local"):
+    """Launch a new session"""
+    api_endpoint = "/api/launch_session"
+    payload = {
+        "method": "launch_session",
+        "kwparams": {
+            "workbench": workbench,
+            "name": session_name,
+            "launch_parameters": {
+                "name": f"{getpass.getuser()}-JL3",
+                "cluster": cluster,
+                "placement_constraints": [],
+                "resource_limits": [],
+                "queues": []
+            }
+        }
+    }
+    return _make_request("POST", base_url + api_endpoint, token, payload)
+
+
+def get_sessions(base_url, token):
+    """Get all active sessions (raw response)"""
+    api_endpoint = "/api/get_sessions"
+    payload = {"method": "get_sessions"}
+    return _make_request("POST", base_url + api_endpoint, token, payload)
+
+
+def list_sessions(base_url, token):
+    """List sessions with simplified info"""
+    data = get_sessions(base_url, token)
+    if data and "result" in data:
+        return [{"id": s.get("id"), "name": s.get("name"), "url": s.get("url")}
+                for s in data["result"].get("sessions", [])]
+    return []
+
+
+def kill_session(base_url, token, session_id):
+    """Kill a specific session by ID"""
+    api_endpoint = "/api/kill_session"
+    payload = {"method": "kill_session", "kwparams": {"session_id": session_id}}
+    return _make_request("POST", base_url + api_endpoint, token, payload)
