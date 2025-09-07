@@ -5,6 +5,7 @@ import json
 import getpass
 import os
 import uvicorn
+import re
 from typing import Optional, List, Dict, Any
 
 app = FastAPI(title="Session Management API", version="1.0.0")
@@ -122,15 +123,83 @@ async def make_api_request(api_endpoint: str, payload: dict, token: str) -> Dict
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=500, detail=f"Failed to parse response JSON: {e}")
 
-async def launch_session_api(token: str, session_name: str, workbench: str, cluster: str) -> dict:
-    """Launch a session using the provided API"""
+async def get_sessions_api(token: str) -> Dict[str, Any]:
+    """Get sessions using the provided API"""
+    payload = {
+        "method": "get_session"
+    }
+    
+    return await make_api_request(GET_SESSION_API, payload, token)
+
+def extract_session_info(session_data: Dict[str, Any]) -> SessionInfo:
+    """Extract session information from the API response"""
+    # Try different possible field names for session name
+    display_name = session_data.get("display_name", "")
+    
+    # If display_name is empty, try other possible fields
+    if not display_name:
+        display_name = session_data.get("name", session_data.get("session_name", ""))
+    
+    return SessionInfo(
+        session_id=session_data.get("id", ""),
+        url=BASE_URL + session_data.get("url", ""),
+        session_name=display_name,
+        display_name=display_name
+    )
+
+def get_next_available_session_number(existing_sessions: List[SessionInfo], username: str) -> int:
+    """
+    Find the next available session number by checking existing session names.
+    Pattern: {username}-JL_Session-{number}
+    """
+    pattern = re.compile(rf"^{re.escape(username)}-JL_Session-(\d+)$")
+    used_numbers = set()
+    
+    for session in existing_sessions:
+        # Check the display_name field where the session name is stored
+        match = pattern.match(session.display_name)
+        if match:
+            try:
+                used_numbers.add(int(match.group(1)))
+            except (ValueError, TypeError):
+                # Handle cases where the number is not a valid integer
+                continue
+    
+    # Find the first available number starting from 1
+    next_number = 1
+    while next_number in used_numbers:
+        next_number += 1
+    
+    return next_number
+
+async def launch_session_api(token: str, session_name: str, workbench: str, cluster: str, username: str) -> dict:
+    """Launch a session using the provided API with unique name"""
+    # First get existing sessions to determine next available number
+    try:
+        sessions_response = await get_sessions_api(token)
+        existing_sessions = []
+        
+        if sessions_response and "result" in sessions_response and "sessions" in sessions_response["result"]:
+            for session_data in sessions_response["result"]["sessions"]:
+                session_info = extract_session_info(session_data)
+                existing_sessions.append(session_info)
+        
+        # Get next available session number
+        next_number = get_next_available_session_number(existing_sessions, username)
+        unique_session_name = f"{username}-JL_Session-{next_number}"
+        
+    except Exception as e:
+        # If we can't get existing sessions, fall back to original naming
+        print(f"Error getting existing sessions, using fallback naming: {e}")
+        unique_session_name = f"{username}-JL3"
+    
     payload = {
         "method": "launch_session",
         "kwparams": {
             "workbench": workbench,
             "name": session_name,
             "launch_parameters": {
-                "name": f"{getpass.getuser()}-JL3",
+                "name": unique_session_name,
                 "cluster": cluster,
                 "placement_constraints": [],
                 "resource_limits": [],
@@ -141,14 +210,6 @@ async def launch_session_api(token: str, session_name: str, workbench: str, clus
     
     return await make_api_request(LAUNCH_API, payload, token)
 
-async def get_sessions_api(token: str) -> Dict[str, Any]:
-    """Get sessions using the provided API"""
-    payload = {
-        "method": "get_session"
-    }
-    
-    return await make_api_request(GET_SESSION_API, payload, token)
-
 # Endpoints
 @app.get("/")
 async def root():
@@ -157,16 +218,20 @@ async def root():
         "message": "Session Management API",
         "version": "1.0.0",
         "endpoints": {
-            "GET /tokens/{user_id}": "Get token for a specific user",
+            "GET /tokens": "Get token for a user (optional user_id query param)",
             "POST /launch-session": "Launch a new session",
             "GET /sessions": "Get all sessions for a user",
             "GET /available-users": "Get list of available users"
         }
     }
 
-@app.get("/tokens/{user_id}", response_model=TokenResponse)
-async def get_token(user_id: str):
-    """Get token for a specific user"""
+@app.get("/tokens", response_model=TokenResponse)
+async def get_token(user_id: Optional[str] = None):
+    """Get token for a specific user. If no user_id provided, returns token for current system user."""
+    if user_id is None:
+        # Use current system user if no user_id provided
+        user_id = getpass.getuser()
+    
     token = get_token_from_json(user_id)
     available_users = get_available_users()
     
@@ -203,7 +268,8 @@ async def launch_session_endpoint(
             token=token,
             session_name=request.session_name,
             workbench=request.workbench,
-            cluster=request.cluster
+            cluster=request.cluster,
+            username=user_id
         )
 
         if response_data and "result" in response_data and "url" in response_data["result"]:
@@ -250,12 +316,7 @@ async def get_sessions_endpoint(
         if response_data and "result" in response_data and "sessions" in response_data["result"]:
             sessions = []
             for session_data in response_data["result"]["sessions"]:
-                session_info = SessionInfo(
-                    session_id=session_data.get("id", ""),
-                    url=BASE_URL + session_data.get("url", ""),
-                    session_name=session_data.get("display_name", ""),
-                    display_name=session_data.get("display_name", "")
-                )
+                session_info = extract_session_info(session_data)
                 sessions.append(session_info)
             
             return GetSessionsResponse(
