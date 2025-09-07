@@ -1,77 +1,75 @@
-import requests, json, getpass, os
+# Add these Pydantic models
+class StopSessionRequest(BaseModel):
+    session_ids: List[str]
+    force_quit: bool = False
+    suspend_session: bool = False
 
+class StopSessionResponse(BaseModel):
+    success: bool
+    message: str
+    stopped_sessions: List[str] = []
+    error: Optional[str] = None
 
-# ----------------- TOKEN MANAGEMENT -----------------
-def get_token_from_json(user_id, filename="tokens.json"):
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    token_file_path = os.path.join(script_dir, filename)
-    try:
-        with open(token_file_path, "r") as file:
-            tokens = json.load(file)
-            return tokens.get(user_id)
-    except (FileNotFoundError, json.JSONDecodeError) as e:
-        print(f"❌ Token error: {e}")
-        return None
+# Add this configuration constant
+STOP_SESSION_API = "/api/stop_session"
 
-
-# ----------------- API CALL HELPER -----------------
-def _make_request(method, url, token, payload=None):
-    headers = {"Content-Type": "application/json",
-               "Authorization": f"Bearer {token}"}
-    try:
-        r = requests.request(method, url, headers=headers,
-                             data=json.dumps(payload) if payload else None,
-                             verify=False)
-        r.raise_for_status()
-        return r.json()
-    except requests.RequestException as e:
-        print(f"❌ Request failed: {e}")
-    except json.JSONDecodeError:
-        print(f"❌ Failed to parse JSON from {url}")
-    return None
-
-
-# ----------------- SESSION FUNCTIONS -----------------
-def launch_session(base_url, token,
-                   session_name="My JupyterLab Session-1",
-                   workbench="JupyterLab", cluster="Local"):
-    """Launch a new session"""
-    api_endpoint = "/api/launch_session"
+# Add this helper function
+async def stop_session_api(token: str, session_ids: List[str], force_quit: bool = False, suspend_session: bool = False) -> Dict[str, Any]:
+    """Stop/kill sessions using the provided API"""
     payload = {
-        "method": "launch_session",
+        "method": "stop_session",
         "kwparams": {
-            "workbench": workbench,
-            "name": session_name,
-            "launch_parameters": {
-                "name": f"{getpass.getuser()}-JL3",
-                "cluster": cluster,
-                "placement_constraints": [],
-                "resource_limits": [],
-                "queues": []
-            }
+            "session_ids": session_ids,
+            "force_quit": force_quit,
+            "suspend_session": suspend_session
         }
     }
-    return _make_request("POST", base_url + api_endpoint, token, payload)
+    
+    return await make_api_request(STOP_SESSION_API, payload, token)
 
+# Add this endpoint
+@app.post("/stop-session", response_model=StopSessionResponse)
+async def stop_session_endpoint(
+    request: StopSessionRequest,
+    x_user_id: Optional[str] = Header(None, description="User ID to look up token from tokens.json")
+):
+    """
+    Stop/kill one or more sessions
+    
+    You can either:
+    1. Provide an X-User-ID header to look up the token from tokens.json
+    2. If no header provided, it will use the current system user
+    """
+    # Get user and token (centralized logic)
+    user_id, token = get_user_token(x_user_id)
 
-def get_sessions(base_url, token):
-    """Get all active sessions (raw response)"""
-    api_endpoint = "/api/get_sessions"
-    payload = {"method": "get_sessions"}
-    return _make_request("POST", base_url + api_endpoint, token, payload)
+    # Stop the sessions
+    try:
+        response_data = await stop_session_api(
+            token=token,
+            session_ids=request.session_ids,
+            force_quit=request.force_quit,
+            suspend_session=request.suspend_session
+        )
 
-
-def list_sessions(base_url, token):
-    """List sessions with simplified info"""
-    data = get_sessions(base_url, token)
-    if data and "result" in data:
-        return [{"id": s.get("id"), "name": s.get("name"), "url": s.get("url")}
-                for s in data["result"].get("sessions", [])]
-    return []
-
-
-def kill_session(base_url, token, session_id):
-    """Kill a specific session by ID"""
-    api_endpoint = "/api/kill_session"
-    payload = {"method": "kill_session", "kwparams": {"session_id": session_id}}
-    return _make_request("POST", base_url + api_endpoint, token, payload)
+        if response_data and "result" in response_data:
+            return StopSessionResponse(
+                success=True,
+                message=f"Successfully stopped {len(request.session_ids)} sessions",
+                stopped_sessions=request.session_ids
+            )
+        else:
+            return StopSessionResponse(
+                success=False,
+                message="Unexpected response format from external API",
+                error=str(response_data)
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        return StopSessionResponse(
+            success=False,
+            message="Failed to stop sessions",
+            error=str(e)
+        )
