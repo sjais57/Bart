@@ -1,14 +1,13 @@
-from fastapi import FastAPI, HTTPException, Depends, Header
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 import requests
 import json
 import getpass
 import os
 import uvicorn
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
-app = FastAPI(title="Session Launch API", version="1.0.0")
+app = FastAPI(title="Session Management API", version="1.0.0")
 
 # Pydantic models for request/response
 class LaunchSessionRequest(BaseModel):
@@ -22,15 +21,35 @@ class LaunchSessionResponse(BaseModel):
     session_url: Optional[str] = None
     error: Optional[str] = None
 
+class SessionInfo(BaseModel):
+    session_id: str
+    url: str
+    session_name: str
+    display_name: str
+
+class GetSessionsResponse(BaseModel):
+    success: bool
+    message: str
+    sessions: List[SessionInfo] = []
+    error: Optional[str] = None
+
 class TokenResponse(BaseModel):
     user_id: str
     token: Optional[str] = None
-    available_users: list = []
+    available_users: List[str] = []
 
+class AvailableUsersResponse(BaseModel):
+    available_users: List[str]
+
+# Configuration
+BASE_URL = "https://url"
+LAUNCH_API = "/api/launch_session"
+GET_SESSION_API = "/api/get_session"
+
+# Helper functions
 def get_token_from_json(user_id: str, filename: str = "tokens.json") -> Optional[str]:
     """Read token from JSON file based on user ID"""
     try:
-        # Get the directory where the script is located
         script_dir = os.path.dirname(os.path.abspath(__file__))
         token_file_path = os.path.join(script_dir, filename)
         
@@ -42,7 +61,7 @@ def get_token_from_json(user_id: str, filename: str = "tokens.json") -> Optional
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail=f"Error parsing JSON file '{filename}'")
 
-def get_available_users(filename: str = "tokens.json") -> list:
+def get_available_users(filename: str = "tokens.json") -> List[str]:
     """Get list of available users from tokens file"""
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -54,93 +73,8 @@ def get_available_users(filename: str = "tokens.json") -> list:
     except (FileNotFoundError, json.JSONDecodeError):
         return []
 
-async def launch_session_api(base_url: str, api_endpoint: str, token: str, 
-                            session_name: str = "My JupyterLab Session-1", 
-                            workbench: str = "JupyterLab", 
-                            cluster: str = "Local") -> dict:
-    """
-    Launch a session using the provided API
-    """
-    payload = json.dumps({
-        "method": "launch_session",
-        "kwparams": {
-            "workbench": workbench,
-            "name": session_name,
-            "launch_parameters": {
-                "name": f"{getpass.getuser()}-JL3",
-                "cluster": cluster,
-                "placement_constraints": [],
-                "resource_limits": [],
-                "queues": []
-            }
-        }
-    })
-
-    headers = {
-        'Content-Type': 'application/json',
-        'Authorization': f'Bearer {token}'
-    }
-
-    try:
-        response = requests.request("POST", base_url + api_endpoint, 
-                                  headers=headers, data=payload, verify=False)
-        response.raise_for_status()
-        
-        return json.loads(response.text)
-        
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=500, detail=f"Request to external API failed: {e}")
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse response JSON: {e}")
-
-@app.get("/")
-async def root():
-    """Root endpoint with API information"""
-    return {
-        "message": "Session Launch API",
-        "version": "1.0.0",
-        "endpoints": {
-            "GET /tokens/{user_id}": "Get token for a specific user",
-            "POST /launch-session": "Launch a new session",
-            "GET /available-users": "Get list of available users"
-        }
-    }
-
-@app.get("/tokens/{user_id}", response_model=TokenResponse)
-async def get_token(user_id: str):
-    """Get token for a specific user"""
-    token = get_token_from_json(user_id)
-    available_users = get_available_users()
-    
-    return TokenResponse(
-        user_id=user_id,
-        token=token,
-        available_users=available_users
-    )
-
-@app.get("/available-users")
-async def get_available_users_endpoint():
-    """Get list of available users from tokens file"""
-    users = get_available_users()
-    return {"available_users": users}
-
-@app.post("/launch-session", response_model=LaunchSessionResponse)
-async def launch_session_endpoint(
-    request: LaunchSessionRequest,
-    x_user_id: Optional[str] = Header(None, description="User ID to look up token from tokens.json")
-):
-    """
-    Launch a session with the provided parameters
-    
-    You can either:
-    1. Provide an X-User-ID header to look up the token from tokens.json
-    2. If no header provided, it will use the current system user
-    """
-    # Configuration
-    base_url = "https://url"
-    launch_api = "/api/launch_session"
-    
-    # Determine user and token
+def get_user_token(x_user_id: Optional[str] = None) -> tuple[str, str]:
+    """Centralized function to get user ID and token"""
     if x_user_id:
         # Look up token by user ID from header
         user_id = x_user_id
@@ -167,12 +101,105 @@ async def launch_session_endpoint(
                     "available_users": available_users
                 }
             )
+    
+    return user_id, token
+
+async def make_api_request(api_endpoint: str, payload: dict, token: str) -> Dict[str, Any]:
+    """Make API request to external service"""
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {token}'
+    }
+
+    try:
+        response = requests.request("POST", BASE_URL + api_endpoint, 
+                                  headers=headers, data=json.dumps(payload), verify=False)
+        response.raise_for_status()
+        return json.loads(response.text)
+        
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=500, detail=f"Request to external API failed: {e}")
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to parse response JSON: {e}")
+
+async def launch_session_api(token: str, session_name: str, workbench: str, cluster: str) -> dict:
+    """Launch a session using the provided API"""
+    payload = {
+        "method": "launch_session",
+        "kwparams": {
+            "workbench": workbench,
+            "name": session_name,
+            "launch_parameters": {
+                "name": f"{getpass.getuser()}-JL3",
+                "cluster": cluster,
+                "placement_constraints": [],
+                "resource_limits": [],
+                "queues": []
+            }
+        }
+    }
+    
+    return await make_api_request(LAUNCH_API, payload, token)
+
+async def get_sessions_api(token: str) -> Dict[str, Any]:
+    """Get sessions using the provided API"""
+    payload = {
+        "method": "get_session"
+    }
+    
+    return await make_api_request(GET_SESSION_API, payload, token)
+
+# Endpoints
+@app.get("/")
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "message": "Session Management API",
+        "version": "1.0.0",
+        "endpoints": {
+            "GET /tokens/{user_id}": "Get token for a specific user",
+            "POST /launch-session": "Launch a new session",
+            "GET /sessions": "Get all sessions for a user",
+            "GET /available-users": "Get list of available users"
+        }
+    }
+
+@app.get("/tokens/{user_id}", response_model=TokenResponse)
+async def get_token(user_id: str):
+    """Get token for a specific user"""
+    token = get_token_from_json(user_id)
+    available_users = get_available_users()
+    
+    return TokenResponse(
+        user_id=user_id,
+        token=token,
+        available_users=available_users
+    )
+
+@app.get("/available-users", response_model=AvailableUsersResponse)
+async def get_available_users_endpoint():
+    """Get list of available users from tokens file"""
+    users = get_available_users()
+    return AvailableUsersResponse(available_users=users)
+
+@app.post("/launch-session", response_model=LaunchSessionResponse)
+async def launch_session_endpoint(
+    request: LaunchSessionRequest,
+    x_user_id: Optional[str] = Header(None, description="User ID to look up token from tokens.json")
+):
+    """
+    Launch a session with the provided parameters
+    
+    You can either:
+    1. Provide an X-User-ID header to look up the token from tokens.json
+    2. If no header provided, it will use the current system user
+    """
+    # Get user and token (centralized logic)
+    user_id, token = get_user_token(x_user_id)
 
     # Launch the session
     try:
         response_data = await launch_session_api(
-            base_url=base_url,
-            api_endpoint=launch_api,
             token=token,
             session_name=request.session_name,
             workbench=request.workbench,
@@ -180,7 +207,7 @@ async def launch_session_endpoint(
         )
 
         if response_data and "result" in response_data and "url" in response_data["result"]:
-            full_url = base_url + response_data["result"]["url"]
+            full_url = BASE_URL + response_data["result"]["url"]
             return LaunchSessionResponse(
                 success=True,
                 message="Session launched successfully",
@@ -199,6 +226,56 @@ async def launch_session_endpoint(
         return LaunchSessionResponse(
             success=False,
             message="Failed to launch session",
+            error=str(e)
+        )
+
+@app.get("/sessions", response_model=GetSessionsResponse)
+async def get_sessions_endpoint(
+    x_user_id: Optional[str] = Header(None, description="User ID to look up token from tokens.json")
+):
+    """
+    Get all sessions for a user
+    
+    You can either:
+    1. Provide an X-User-ID header to look up the token from tokens.json
+    2. If no header provided, it will use the current system user
+    """
+    # Get user and token (centralized logic)
+    user_id, token = get_user_token(x_user_id)
+
+    # Get sessions
+    try:
+        response_data = await get_sessions_api(token)
+
+        if response_data and "result" in response_data and "sessions" in response_data["result"]:
+            sessions = []
+            for session_data in response_data["result"]["sessions"]:
+                session_info = SessionInfo(
+                    session_id=session_data.get("id", ""),
+                    url=BASE_URL + session_data.get("url", ""),
+                    session_name=session_data.get("display_name", ""),
+                    display_name=session_data.get("display_name", "")
+                )
+                sessions.append(session_info)
+            
+            return GetSessionsResponse(
+                success=True,
+                message=f"Found {len(sessions)} sessions",
+                sessions=sessions
+            )
+        else:
+            return GetSessionsResponse(
+                success=False,
+                message="No sessions found or unexpected response format",
+                error=str(response_data) if response_data else "Empty response"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        return GetSessionsResponse(
+            success=False,
+            message="Failed to get sessions",
             error=str(e)
         )
 
