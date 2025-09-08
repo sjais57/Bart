@@ -1,58 +1,45 @@
-# Add these Pydantic models
-class StopSessionRequest(BaseModel):
-    session_ids: List[str]
-    force_quit: bool = False
-    suspend_session: bool = False
-
-class StopSessionResponse(BaseModel):
-    success: bool
-    message: str
-    stopped_sessions: List[str] = []
-    error: Optional[str] = None
-
-# Add this configuration constant
-STOP_SESSION_API = "/api/stop_session"
-
-# Add this helper function
-async def stop_session_api(token: str, session_ids: List[str], force_quit: bool = False, suspend_session: bool = False) -> Dict[str, Any]:
-    """Stop/kill sessions using the provided API"""
-    payload = {
-        "method": "stop_session",
-        "kwparams": {
-            "session_ids": session_ids,
-            "force_quit": force_quit,
-            "suspend_session": suspend_session
-        }
-    }
-    
-    return await make_api_request(STOP_SESSION_API, payload, token)
-
-# Add this endpoint
 @app.post("/stop-session", response_model=StopSessionResponse)
 async def stop_session_endpoint(
     request: StopSessionRequest,
-    x_user_id: Optional[str] = Header(None, description="User ID to look up token from tokens.json")
+    x_user_id: str = Header(..., description="User ID to look up token from tokens.json")
 ):
-    """
-    Stop/kill one or more sessions
-    
-    You can either:
-    1. Provide an X-User-ID header to look up the token from tokens.json
-    2. If no header provided, it will use the current system user
-    """
-    # Get user and token (centralized logic)
+    """Stop/kill one or more sessions"""
     user_id, token = get_user_token(x_user_id)
 
-    # Stop the sessions
     try:
-        response_data = await stop_session_api(
-            token=token,
-            session_ids=request.session_ids,
-            force_quit=request.force_quit,
-            suspend_session=request.suspend_session
-        )
+        # Direct API call without wrapper for testing
+        url = BASE_URL + STOP_SESSION_API
+        payload = json.dumps({
+            "method": "stop_session",
+            "kwparams": {
+                "session_ids": request.session_ids,
+                "force_quit": request.force_quit,
+                "suspend_session": request.suspend_session
+            }
+        })
+        
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {token}'
+        }
 
-        if response_data and "result" in response_data:
+        response = requests.request("POST", url, headers=headers, data=payload, verify=False)
+        response.raise_for_status()
+        response_data = json.loads(response.text)
+        
+        # Debug output to see what the API actually returns
+        print(f"Stop session API response: {json.dumps(response_data, indent=2)}")
+        print(f"HTTP Status: {response.status_code}")
+
+        # Check for various success indicators
+        success_indicators = [
+            response_data.get("result"),
+            response_data.get("success"),
+            response_data.get("status") == "success",
+            response_data.get("message") and "success" in response_data.get("message", "").lower()
+        ]
+
+        if any(success_indicators):
             return StopSessionResponse(
                 success=True,
                 message=f"Successfully stopped {len(request.session_ids)} sessions",
@@ -61,13 +48,26 @@ async def stop_session_endpoint(
         else:
             return StopSessionResponse(
                 success=False,
-                message="Unexpected response format from external API",
-                error=str(response_data)
+                message="Stop operation may have failed - check API response",
+                error=f"API Response: {response_data}"
             )
             
-    except HTTPException:
-        raise
+    except requests.exceptions.RequestException as e:
+        print(f"Request error: {e}")
+        return StopSessionResponse(
+            success=False,
+            message="Failed to connect to external API",
+            error=str(e)
+        )
+    except json.JSONDecodeError as e:
+        print(f"JSON decode error: {e}")
+        return StopSessionResponse(
+            success=False,
+            message="Invalid response from external API",
+            error=str(e)
+        )
     except Exception as e:
+        print(f"Unexpected error: {e}")
         return StopSessionResponse(
             success=False,
             message="Failed to stop sessions",
