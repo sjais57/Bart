@@ -7,12 +7,15 @@ async def stop_session_endpoint(
     user_id, token = get_user_token(x_user_id)
 
     try:
-        # Direct API call without wrapper for testing
+        # Convert session_ids list to comma-separated string
+        session_ids_str = ",".join(request.session_ids)
+        
+        # Direct API call
         url = BASE_URL + STOP_SESSION_API
         payload = json.dumps({
             "method": "stop_session",
             "kwparams": {
-                "session_ids": request.session_ids,
+                "session_ids": session_ids_str,
                 "force_quit": request.force_quit,
                 "suspend_session": request.suspend_session
             }
@@ -23,23 +26,27 @@ async def stop_session_endpoint(
             'Authorization': f'Bearer {token}'
         }
 
+        print(f"Request payload: {payload}")
+
         response = requests.request("POST", url, headers=headers, data=payload, verify=False)
-        response.raise_for_status()
-        response_data = json.loads(response.text)
         
-        # Debug output to see what the API actually returns
-        print(f"Stop session API response: {json.dumps(response_data, indent=2)}")
+        # Debug output
         print(f"HTTP Status: {response.status_code}")
+        print(f"Response content: {response.text[:500]}")  # First 500 chars
 
-        # Check for various success indicators
-        success_indicators = [
-            response_data.get("result"),
-            response_data.get("success"),
-            response_data.get("status") == "success",
-            response_data.get("message") and "success" in response_data.get("message", "").lower()
-        ]
-
-        if any(success_indicators):
+        # Check if response is JSON
+        response_data = None
+        if response.text.strip():  # If response is not empty
+            try:
+                response_data = response.json()
+                print(f"JSON response: {json.dumps(response_data, indent=2)}")
+            except json.JSONDecodeError:
+                # Not JSON, but might still be successful
+                print("Response is not JSON format")
+        
+        # Check for success based on HTTP status code
+        if response.status_code == 200:
+            # If we get HTTP 200, consider it successful regardless of response format
             return StopSessionResponse(
                 success=True,
                 message=f"Successfully stopped {len(request.session_ids)} sessions",
@@ -48,8 +55,8 @@ async def stop_session_endpoint(
         else:
             return StopSessionResponse(
                 success=False,
-                message="Stop operation may have failed - check API response",
-                error=f"API Response: {response_data}"
+                message=f"API returned HTTP {response.status_code}",
+                error=f"Response: {response.text[:200]}"
             )
             
     except requests.exceptions.RequestException as e:
@@ -57,13 +64,6 @@ async def stop_session_endpoint(
         return StopSessionResponse(
             success=False,
             message="Failed to connect to external API",
-            error=str(e)
-        )
-    except json.JSONDecodeError as e:
-        print(f"JSON decode error: {e}")
-        return StopSessionResponse(
-            success=False,
-            message="Invalid response from external API",
             error=str(e)
         )
     except Exception as e:
