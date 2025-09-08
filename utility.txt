@@ -1,3 +1,24 @@
+async def stop_session_api(token: str, session_ids: List[str], force_quit: bool = False, suspend_session: bool = False) -> Dict[str, Any]:
+    """Stop/kill sessions using the provided API"""
+    # Convert session_ids list to comma-separated string for the external API
+    session_ids_str = ",".join(session_ids)
+    
+    payload = {
+        "method": "stop_session",
+        "kwparams": {
+            "session_ids": session_ids_str,  # Send as string
+            "force_quit": force_quit,
+            "suspend_session": suspend_session
+        }
+    }
+    
+    response_data = await make_api_request(STOP_SESSION_API, payload, token)
+    
+    # Debug logging to see actual response structure
+    print(f"Stop session API response: {response_data}")
+    
+    return response_data
+
 @app.post("/stop-session", response_model=StopSessionResponse)
 async def stop_session_endpoint(
     request: StopSessionRequest,
@@ -7,58 +28,28 @@ async def stop_session_endpoint(
     user_id, token = get_user_token(x_user_id)
 
     try:
-        # Convert session_ids list to comma-separated string
-        session_ids_str = ",".join(request.session_ids)
-        
-        # Direct API call
-        url = BASE_URL + STOP_SESSION_API
-        payload = json.dumps({
-            "method": "stop_session",
-            "kwparams": {
-                "session_ids": session_ids_str,
-                "force_quit": request.force_quit,
-                "suspend_session": request.suspend_session
-            }
-        })
-        
-        headers = {
-            'Content-Type': 'application/json',
-            'Authorization': f'Bearer {token}'
-        }
+        response_data = await stop_session_api(
+            token=token,
+            session_ids=request.session_ids,
+            force_quit=request.force_quit,
+            suspend_session=request.suspend_session
+        )
 
-        print(f"Request payload: {payload}")
-
-        response = requests.request("POST", url, headers=headers, data=payload, verify=False)
+        # For stop session, we primarily care about HTTP status code
+        # The external API might return empty or non-JSON response on success
+        # So we consider HTTP 200 as success regardless of response content
         
-        # Debug output
-        print(f"HTTP Status: {response.status_code}")
-        print(f"Response content: {response.text[:500]}")  # First 500 chars
-
-        # Check if response is JSON
-        response_data = None
-        if response.text.strip():  # If response is not empty
-            try:
-                response_data = response.json()
-                print(f"JSON response: {json.dumps(response_data, indent=2)}")
-            except json.JSONDecodeError:
-                # Not JSON, but might still be successful
-                print("Response is not JSON format")
-        
-        # Check for success based on HTTP status code
-        if response.status_code == 200:
-            # If we get HTTP 200, consider it successful regardless of response format
-            return StopSessionResponse(
-                success=True,
-                message=f"Successfully stopped {len(request.session_ids)} sessions",
-                stopped_sessions=request.session_ids
-            )
-        else:
-            return StopSessionResponse(
-                success=False,
-                message=f"API returned HTTP {response.status_code}",
-                error=f"Response: {response.text[:200]}"
-            )
+        # If we got this far without exception, the request was successful
+        # (make_api_request raises exceptions for non-2xx status codes)
+        return StopSessionResponse(
+            success=True,
+            message=f"Successfully stopped {len(request.session_ids)} sessions",
+            stopped_sessions=request.session_ids
+        )
             
+    except HTTPException as e:
+        # Re-raise HTTP exceptions to maintain proper status codes
+        raise e
     except requests.exceptions.RequestException as e:
         print(f"Request error: {e}")
         return StopSessionResponse(
