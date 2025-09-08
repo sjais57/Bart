@@ -6,7 +6,7 @@ import getpass
 import os
 import uvicorn
 import re
-from typing import Optional, List, Dict, Any
+from typing import List, Dict, Any
 
 app = FastAPI(title="Session Management API", version="1.0.0")
 
@@ -16,11 +16,16 @@ class LaunchSessionRequest(BaseModel):
     workbench: str = "JupyterLab"
     cluster: str = "Local"
 
+class StopSessionRequest(BaseModel):
+    session_ids: List[str]
+    force_quit: bool = False
+    suspend_session: bool = False
+
 class LaunchSessionResponse(BaseModel):
     success: bool
     message: str
-    session_url: Optional[str] = None
-    error: Optional[str] = None
+    session_url: str = None
+    error: str = None
 
 class SessionInfo(BaseModel):
     session_id: str
@@ -32,11 +37,17 @@ class GetSessionsResponse(BaseModel):
     success: bool
     message: str
     sessions: List[SessionInfo] = []
-    error: Optional[str] = None
+    error: str = None
+
+class StopSessionResponse(BaseModel):
+    success: bool
+    message: str
+    stopped_sessions: List[str] = []
+    error: str = None
 
 class TokenResponse(BaseModel):
     user_id: str
-    token: Optional[str] = None
+    token: str = None
     available_users: List[str] = []
 
 class AvailableUsersResponse(BaseModel):
@@ -46,9 +57,10 @@ class AvailableUsersResponse(BaseModel):
 BASE_URL = "https://url"
 LAUNCH_API = "/api/launch_session"
 GET_SESSION_API = "/api/get_session"
+STOP_SESSION_API = "/api/stop_session"
 
 # Helper functions
-def get_token_from_json(user_id: str, filename: str = "tokens.json") -> Optional[str]:
+def get_token_from_json(user_id: str, filename: str = "tokens.json") -> str:
     """Read token from JSON file based on user ID"""
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -56,7 +68,10 @@ def get_token_from_json(user_id: str, filename: str = "tokens.json") -> Optional
         
         with open(token_file_path, 'r') as file:
             tokens = json.load(file)
-            return tokens.get(user_id)
+            token = tokens.get(user_id)
+            if not token:
+                raise HTTPException(status_code=404, detail=f"Token not found for user: {user_id}")
+            return token
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Token file '{filename}' not found")
     except json.JSONDecodeError:
@@ -74,36 +89,10 @@ def get_available_users(filename: str = "tokens.json") -> List[str]:
     except (FileNotFoundError, json.JSONDecodeError):
         return []
 
-def get_user_token(x_user_id: Optional[str] = None) -> tuple[str, str]:
-    """Centralized function to get user ID and token"""
-    if x_user_id:
-        # Look up token by user ID from header
-        user_id = x_user_id
-        token = get_token_from_json(user_id)
-        if not token:
-            available_users = get_available_users()
-            raise HTTPException(
-                status_code=404, 
-                detail={
-                    "message": f"Token not found for user: {user_id}",
-                    "available_users": available_users
-                }
-            )
-    else:
-        # Use current system user
-        user_id = getpass.getuser()
-        token = get_token_from_json(user_id)
-        if not token:
-            available_users = get_available_users()
-            raise HTTPException(
-                status_code=404, 
-                detail={
-                    "message": f"Token not found for current user: {user_id}",
-                    "available_users": available_users
-                }
-            )
-    
-    return user_id, token
+def get_user_token(x_user_id: str) -> tuple[str, str]:
+    """Centralized function to get user ID and token - user_id is mandatory"""
+    token = get_token_from_json(x_user_id)
+    return x_user_id, token
 
 async def make_api_request(api_endpoint: str, payload: dict, token: str) -> Dict[str, Any]:
     """Make API request to external service"""
@@ -131,12 +120,23 @@ async def get_sessions_api(token: str) -> Dict[str, Any]:
     
     return await make_api_request(GET_SESSION_API, payload, token)
 
+async def stop_session_api(token: str, session_ids: List[str], force_quit: bool = False, suspend_session: bool = False) -> Dict[str, Any]:
+    """Stop/kill sessions using the provided API"""
+    payload = {
+        "method": "stop_session",
+        "kwparams": {
+            "session_ids": session_ids,
+            "force_quit": force_quit,
+            "suspend_session": suspend_session
+        }
+    }
+    
+    return await make_api_request(STOP_SESSION_API, payload, token)
+
 def extract_session_info(session_data: Dict[str, Any]) -> SessionInfo:
     """Extract session information from the API response"""
-    # Try different possible field names for session name
     display_name = session_data.get("display_name", "")
     
-    # If display_name is empty, try other possible fields
     if not display_name:
         display_name = session_data.get("name", session_data.get("session_name", ""))
     
@@ -156,16 +156,13 @@ def get_next_available_session_number(existing_sessions: List[SessionInfo], user
     used_numbers = set()
     
     for session in existing_sessions:
-        # Check the display_name field where the session name is stored
         match = pattern.match(session.display_name)
         if match:
             try:
                 used_numbers.add(int(match.group(1)))
             except (ValueError, TypeError):
-                # Handle cases where the number is not a valid integer
                 continue
     
-    # Find the first available number starting from 1
     next_number = 1
     while next_number in used_numbers:
         next_number += 1
@@ -174,7 +171,6 @@ def get_next_available_session_number(existing_sessions: List[SessionInfo], user
 
 async def launch_session_api(token: str, session_name: str, workbench: str, cluster: str, username: str) -> dict:
     """Launch a session using the provided API with unique name"""
-    # First get existing sessions to determine next available number
     try:
         sessions_response = await get_sessions_api(token)
         existing_sessions = []
@@ -184,14 +180,12 @@ async def launch_session_api(token: str, session_name: str, workbench: str, clus
                 session_info = extract_session_info(session_data)
                 existing_sessions.append(session_info)
         
-        # Get next available session number
         next_number = get_next_available_session_number(existing_sessions, username)
         unique_session_name = f"{username}-JL_Session-{next_number}"
         
     except Exception as e:
-        # If we can't get existing sessions, fall back to original naming
-        print(f"Error getting existing sessions, using fallback naming: {e}")
-        unique_session_name = f"{username}-JL3"
+        print(f"Error getting existing sessions, using simple naming: {e}")
+        unique_session_name = f"{username}-JL_Session-1"
     
     payload = {
         "method": "launch_session",
@@ -218,20 +212,17 @@ async def root():
         "message": "Session Management API",
         "version": "1.0.0",
         "endpoints": {
-            "GET /tokens": "Get token for a user (optional user_id query param)",
-            "POST /launch-session": "Launch a new session",
-            "GET /sessions": "Get all sessions for a user",
+            "GET /tokens/{user_id}": "Get token for a specific user",
+            "POST /launch-session": "Launch a new session (requires X-User-ID header)",
+            "GET /sessions": "Get all sessions for a user (requires X-User-ID header)",
+            "POST /stop-session": "Stop/kill one or more sessions (requires X-User-ID header)",
             "GET /available-users": "Get list of available users"
         }
     }
 
-@app.get("/tokens", response_model=TokenResponse)
-async def get_token(user_id: Optional[str] = None):
-    """Get token for a specific user. If no user_id provided, returns token for current system user."""
-    if user_id is None:
-        # Use current system user if no user_id provided
-        user_id = getpass.getuser()
-    
+@app.get("/tokens/{user_id}", response_model=TokenResponse)
+async def get_token(user_id: str):
+    """Get token for a specific user"""
     token = get_token_from_json(user_id)
     available_users = get_available_users()
     
@@ -250,19 +241,11 @@ async def get_available_users_endpoint():
 @app.post("/launch-session", response_model=LaunchSessionResponse)
 async def launch_session_endpoint(
     request: LaunchSessionRequest,
-    x_user_id: Optional[str] = Header(None, description="User ID to look up token from tokens.json")
+    x_user_id: str = Header(..., description="User ID to look up token from tokens.json")
 ):
-    """
-    Launch a session with the provided parameters
-    
-    You can either:
-    1. Provide an X-User-ID header to look up the token from tokens.json
-    2. If no header provided, it will use the current system user
-    """
-    # Get user and token (centralized logic)
+    """Launch a session with the provided parameters"""
     user_id, token = get_user_token(x_user_id)
 
-    # Launch the session
     try:
         response_data = await launch_session_api(
             token=token,
@@ -297,19 +280,11 @@ async def launch_session_endpoint(
 
 @app.get("/sessions", response_model=GetSessionsResponse)
 async def get_sessions_endpoint(
-    x_user_id: Optional[str] = Header(None, description="User ID to look up token from tokens.json")
+    x_user_id: str = Header(..., description="User ID to look up token from tokens.json")
 ):
-    """
-    Get all sessions for a user
-    
-    You can either:
-    1. Provide an X-User-ID header to look up the token from tokens.json
-    2. If no header provided, it will use the current system user
-    """
-    # Get user and token (centralized logic)
+    """Get all sessions for a user"""
     user_id, token = get_user_token(x_user_id)
 
-    # Get sessions
     try:
         response_data = await get_sessions_api(token)
 
@@ -337,6 +312,44 @@ async def get_sessions_endpoint(
         return GetSessionsResponse(
             success=False,
             message="Failed to get sessions",
+            error=str(e)
+        )
+
+@app.post("/stop-session", response_model=StopSessionResponse)
+async def stop_session_endpoint(
+    request: StopSessionRequest,
+    x_user_id: str = Header(..., description="User ID to look up token from tokens.json")
+):
+    """Stop/kill one or more sessions"""
+    user_id, token = get_user_token(x_user_id)
+
+    try:
+        response_data = await stop_session_api(
+            token=token,
+            session_ids=request.session_ids,
+            force_quit=request.force_quit,
+            suspend_session=request.suspend_session
+        )
+
+        if response_data:
+            return StopSessionResponse(
+                success=True,
+                message=f"Successfully stopped {len(request.session_ids)} sessions",
+                stopped_sessions=request.session_ids
+            )
+        else:
+            return StopSessionResponse(
+                success=False,
+                message="Empty response from external API",
+                error="No response data received"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        return StopSessionResponse(
+            success=False,
+            message="Failed to stop sessions",
             error=str(e)
         )
 
