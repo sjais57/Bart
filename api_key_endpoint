@@ -1,0 +1,316 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from typing import Dict, List, Any, Optional
+import yaml
+from datetime import datetime
+import uuid
+import json
+
+app = FastAPI(title="API Key Generator", description="Generate API key configuration files in YAML format")
+
+class StaticClaims(BaseModel):
+    key: str = Field(..., description="API key identifier")
+    models: List[str] = Field(..., description="List of allowed models")
+    rate_limit: int = Field(..., description="Rate limit value")
+    tier: str = Field(..., description="Tier level")
+    exp_hours: int = Field(..., description="Expiration hours")
+
+class DynamicClaimConfig(BaseModel):
+    type: str = Field(..., description="Type of dynamic claim (api or function)")
+    url: Optional[str] = Field(None, description="URL for API type claims")
+    method: Optional[str] = Field(None, description="HTTP method for API type claims")
+    headers: Optional[Dict[str, str]] = Field(None, description="Headers for API type claims")
+    response_field: Optional[str] = Field(None, description="Response field for API type claims")
+    module: Optional[str] = Field(None, description="Module for function type claims")
+    function: Optional[str] = Field(None, description="Function name for function type claims")
+    args: Optional[Dict[str, str]] = Field(None, description="Arguments for function type claims")
+
+class Claims(BaseModel):
+    static: StaticClaims
+    dynamic: Dict[str, DynamicClaimConfig]
+
+class TeamPermissions(BaseModel):
+    can_manage_users: bool
+    can_create_api_keys: bool
+    can_view_billing: bool
+    max_models_per_request: int
+
+class Category(BaseModel):
+    groups: List[str]
+    tier: int
+    destURL: str
+
+class Context(BaseModel):
+    organization_id: str
+    deployment_region: str
+    service_tier: str
+
+class RateLimiting(BaseModel):
+    window_seconds: int
+    max_requests: int
+
+class RequestData(BaseModel):
+    allowed_domains: List[str]
+    rate_limiting: RateLimiting
+
+class LoggingConfig(BaseModel):
+    level: str
+    detailed_errors: bool
+
+class ModelParams(BaseModel):
+    temperature: float
+    top_p: float
+    max_tokens: int
+
+class ModelConfig(BaseModel):
+    default_params: ModelParams
+
+class FunctionParams(BaseModel):
+    logging: LoggingConfig
+    model_config: ModelConfig
+
+class TestCase(BaseModel):
+    model: str
+    endpoint: str
+    expected_response: str
+
+class TestScenario(BaseModel):
+    provider: str
+    expected_status: int
+    test_cases: List[TestCase]
+
+class JsonData(BaseModel):
+    test_scenarios: Dict[str, TestScenario]
+
+class Metadata(BaseModel):
+    team_permissions: Dict[str, TeamPermissions]
+    categories: Dict[str, Category]
+    context: Context
+    request_data: RequestData
+    function_params: FunctionParams
+    json_data: Optional[str] = None
+
+class APIKeyRequest(BaseModel):
+    claims: Claims
+    metadata: Metadata
+
+class APIKeyResponse(BaseModel):
+    api_key_id: str
+    yaml_content: str
+    filename: str
+    message: str
+
+@app.post("/generate-api-key", response_model=APIKeyResponse)
+async def generate_api_key(request: APIKeyRequest):
+    """
+    Generate an API key configuration file in YAML format.
+    """
+    try:
+        # Generate a unique API key ID
+        api_key_id = str(uuid.uuid4())
+        
+        # Prepare the data structure
+        config_data = {
+            "claims": {
+                "static": request.claims.static.dict(),
+                "dynamic": {
+                    key: value.dict(exclude_none=True) 
+                    for key, value in request.claims.dynamic.items()
+                }
+            },
+            "metadata": {
+                "team_permissions": {
+                    key: value.dict() 
+                    for key, value in request.metadata.team_permissions.items()
+                },
+                "categories": {
+                    key: value.dict() 
+                    for key, value in request.metadata.categories.items()
+                },
+                "context": request.metadata.context.dict(),
+                "request_data": {
+                    "allowed_domains": request.metadata.request_data.allowed_domains,
+                    "rate_limiting": request.metadata.request_data.rate_limiting.dict()
+                },
+                "function_params": {
+                    "logging": request.metadata.function_params.logging.dict(),
+                    "model_config": {
+                        "default_params": request.metadata.function_params.model_config.default_params.dict()
+                    }
+                }
+            }
+        }
+        
+        # Add JSON data if provided
+        if request.metadata.json_data:
+            config_data["metadata"]["json_data"] = request.metadata.json_data
+        
+        # Convert to YAML
+        yaml_content = yaml.dump(config_data, default_flow_style=False, sort_keys=False, allow_unicode=True)
+        
+        # Create filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"ak_tiered_model_exec_{timestamp}.yaml"
+        
+        return APIKeyResponse(
+            api_key_id=api_key_id,
+            yaml_content=yaml_content,
+            filename=filename,
+            message="API key configuration generated successfully"
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating API key: {str(e)}")
+
+@app.get("/generate-sample")
+async def generate_sample_config():
+    """
+    Generate a sample API key configuration based on the provided structure.
+    """
+    try:
+        sample_data = {
+            "claims": {
+                "static": {
+                    "key": "ak_tiered_model_exec",
+                    "models": ["gpt-3.5-turbo", "gpt-4"],
+                    "rate_limit": 200,
+                    "tier": "enterprise",
+                    "exp_hours": 24
+                },
+                "dynamic": {
+                    "budget_status": {
+                        "type": "api",
+                        "url": "http://127.0.0.1:5001/api/budget/{api_key_id}",
+                        "method": "GET",
+                        "headers": {"X-Internal-Auth": "{internal_token}"},
+                        "response_field": "remaining_budget"
+                    },
+                    "team_permissions": {
+                        "type": "function",
+                        "module": "claims.permissions",
+                        "function": "get_team_permissions",
+                        "args": {
+                            "team_id": "{team_id}",
+                            "api_key_id": "{api_key_id}"
+                        }
+                    },
+                    "user_category": {
+                        "type": "function",
+                        "module": "claims.group_category",
+                        "function": "get_user_category",
+                        "args": {
+                            "user_groups": "{groups}",
+                            "lookup_mode": "TIERED_MATCH"
+                        }
+                    }
+                }
+            },
+            "metadata": {
+                "team_permissions": {
+                    "admin-team": {
+                        "can_manage_users": True,
+                        "can_create_api_keys": True,
+                        "can_view_billing": True,
+                        "max_models_per_request": 1000
+                    },
+                    "ai-team": {
+                        "can_manage_users": False,
+                        "can_create_api_keys": False,
+                        "can_view_billing": False,
+                        "max_models_per_request": 4000
+                    }
+                },
+                "categories": {
+                    "gold": {
+                        "groups": ["grp_tier1", "powerusers"],
+                        "tier": 3,
+                        "destURL": "debug/request-info?user_category=gold"
+                    },
+                    "silver": {
+                        "groups": ["grp_tier2", "contributors"],
+                        "tier": 2,
+                        "destURL": "debug/request-info?user_category=silver"
+                    },
+                    "bronze": {
+                        "groups": ["grp_tier3"],
+                        "tier": 1,
+                        "destURL": "debug/request-info?user_category=bronze"
+                    }
+                },
+                "context": {
+                    "organization_id": "org-12345",
+                    "deployment_region": "us-east-1",
+                    "service_tier": "premium"
+                },
+                "request_data": {
+                    "allowed_domains": ["example.com", "api.company.net"],
+                    "rate_limiting": {
+                        "window_seconds": 60,
+                        "max_requests": 120
+                    }
+                },
+                "function_params": {
+                    "logging": {
+                        "level": "info",
+                        "detailed_errors": True
+                    },
+                    "model_config": {
+                        "default_params": {
+                            "temperature": 0.7,
+                            "top_p": 0.95,
+                            "max_tokens": 2048
+                        }
+                    }
+                },
+                "json_data": """{
+    "test_scenarios": {
+        "openai_only": {
+            "provider": "openai",
+            "expected_status": 200,
+            "test_cases": [
+                {
+                    "model": "gpt-4",
+                    "endpoint": "/v1/chat/completions",
+                    "expected_response": "success"
+                },
+                {
+                    "model": "llama3-70b",
+                    "endpoint": "/v1/chat/completions",
+                    "expected_response": "unauthorized_model"
+                }
+            ]
+        },
+        "groq_only": {
+            "provider": "groq",
+            "expected_status": 200,
+            "test_cases": [
+                {
+                    "model": "llama3-70b",
+                    "endpoint": "/v1/chat/completions",
+                    "expected_response": "success"
+                },
+                {
+                    "model": "gpt-4",
+                    "endpoint": "/v1/chat/completions",
+                    "expected_response": "unauthorized_model"
+                }
+            ]
+        }
+    }
+}"""
+            }
+        }
+        
+        yaml_content = yaml.dump(sample_data, default_flow_style=False, sort_keys=False, allow_unicode=True)
+        
+        return {
+            "yaml_content": yaml_content,
+            "message": "Sample configuration generated successfully"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating sample: {str(e)}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
