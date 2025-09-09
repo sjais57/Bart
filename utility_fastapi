@@ -15,16 +15,13 @@ class LaunchSessionRequest(BaseModel):
     session_name: str = "My JupyterLab Session-1"
     workbench: str = "JupyterLab"
     cluster: str = "Local"
-    base_url: str = Field(..., description="Base URL for the API")
+    base_url: str = Field(..., description="Base URL for the API (without https://)")
 
 class StopSessionRequest(BaseModel):
     session_ids: List[str]
     force_quit: bool = False
     suspend_session: bool = False
-    base_url: str = Field(..., description="Base URL for the API")
-
-class GetSessionsRequest(BaseModel):
-    base_url: str = Field(..., description="Base URL for the API")
+    base_url: str = Field(..., description="Base URL for the API (without https://)")
 
 class LaunchSessionResponse(BaseModel):
     success: bool
@@ -62,6 +59,12 @@ class AvailableUsersResponse(BaseModel):
 LAUNCH_API = "/api/launch_session"
 GET_SESSION_API = "/api/get_session"
 STOP_SESSION_API = "/api/stop_session"
+
+def format_base_url(base_url: str) -> str:
+    """Format base URL to ensure it has https:// prefix"""
+    if not base_url.startswith(('http://', 'https://')):
+        return f"https://{base_url}"
+    return base_url
 
 # Helper functions
 def get_token_from_json(username: str, filename: str = "tokens.json") -> str:
@@ -106,7 +109,8 @@ async def make_api_request(base_url: str, api_endpoint: str, payload: dict, toke
     }
 
     try:
-        response = requests.request("POST", base_url + api_endpoint, 
+        formatted_base_url = format_base_url(base_url)
+        response = requests.request("POST", formatted_base_url + api_endpoint, 
                                   headers=headers, data=json.dumps(payload), verify=False)
         response.raise_for_status()
         return json.loads(response.text)
@@ -147,9 +151,10 @@ def extract_session_info(base_url: str, session_data: Dict[str, Any]) -> Session
     if not display_name:
         display_name = session_data.get("name", session_data.get("session_name", ""))
     
+    formatted_base_url = format_base_url(base_url)
     return SessionInfo(
         session_id=session_data.get("id", ""),
-        url=base_url + session_data.get("url", ""),
+        url=formatted_base_url + session_data.get("url", ""),
         session_name=display_name,
         display_name=display_name
     )
@@ -264,7 +269,8 @@ async def launch_session_endpoint(
         )
 
         if response_data and "result" in response_data and "url" in response_data["result"]:
-            full_url = request.base_url + response_data["result"]["url"]
+            formatted_base_url = format_base_url(request.base_url)
+            full_url = formatted_base_url + response_data["result"]["url"]
             return LaunchSessionResponse(
                 success=True,
                 message="Session launched successfully",
@@ -289,7 +295,7 @@ async def launch_session_endpoint(
 @app.get("/sessions", response_model=GetSessionsResponse)
 async def get_sessions_endpoint(
     username: str = Header(..., description="User ID to look up token from tokens.json"),
-    base_url: str = Header(..., description="Base URL for the API")
+    base_url: str = Header(..., description="Base URL for the API (without https://)")
 ):
     """Get all sessions for a user"""
     username, token = get_user_token(username)
