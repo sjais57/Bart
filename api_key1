@@ -1,0 +1,125 @@
+from fastapi import FastAPI
+from pydantic import BaseModel
+import yaml
+
+app = FastAPI()
+
+class APIKeyRequest(BaseModel):
+    key: str
+    models: list[str]
+    rate_limit: int
+    tier: str
+    exp_hours: int
+
+@app.post("/create-api-key")
+async def create_api_key_file(request: APIKeyRequest):
+    data = {
+        "claims": {
+            "static": {
+                "key": request.key,
+                "models": request.models,
+                "rate_limit": request.rate_limit,
+                "tier": request.tier,
+                "exp_hours": request.exp_hours
+            },
+            "dynamic": {
+                "budget_status": {
+                    "type": "api",
+                    "url": "http://127.0.0.1:5001/api/budget/{api_key_id}",
+                    "method": "GET",
+                    "headers": {"X-Internal-Auth": "{internal_token}"},
+                    "response_field": "remaining_budget"
+                },
+                "team_permissions": {
+                    "type": "function",
+                    "module": "claims.permissions",
+                    "function": "get_team_permissions",
+                    "args": {"team_id": "{team_id}", "api_key_id": "{api_key_id}"}
+                },
+                "user_category": {
+                    "type": "function",
+                    "module": "claims.group_category",
+                    "function": "get_user_category",
+                    "args": {"user_groups": "{groups}", "lookup_mode": "TIERED_MATCH"}
+                }
+            }
+        },
+        "metadata": {
+            "team_permissions": {
+                "admin-team": {
+                    "can_manage_users": True,
+                    "can_create_api_keys": True,
+                    "can_view_billing": True,
+                    "max_models_per_request": 1000
+                },
+                "ai-team": {
+                    "can_manage_users": False,
+                    "can_create_api_keys": False,
+                    "can_view_billing": False,
+                    "max_models_per_request": 4000
+                }
+            },
+            "categories": {
+                "gold": {
+                    "groups": ["grp_tier1", "powerusers"],
+                    "tier": 3,
+                    "destURL": "debug/request-info?user_category=gold"
+                },
+                "silver": {
+                    "groups": ["grp_tier2", "contributors"],
+                    "tier": 2,
+                    "destURL": "debug/request-info?user_category=silver"
+                },
+                "bronze": {
+                    "groups": ["grp_tier3"],
+                    "tier": 1,
+                    "destURL": "debug/request-info?user_category=bronze"
+                }
+            },
+            "context": {
+                "organization_id": "org-12345",
+                "deployment_region": "us-east-1",
+                "service_tier": "premium"
+            },
+            "request_data": {
+                "allowed_domains": ["example.com", "api.company.net"],
+                "rate_limiting": {"window_seconds": 60, "max_requests": 120}
+            },
+            "function_params": {
+                "logging": {"level": "info", "detailed_errors": True},
+                "model_config": {
+                    "default_params": {
+                        "temperature": 0.7,
+                        "top_p": 0.95,
+                        "max_tokens": 2048
+                    }
+                }
+            },
+            "json_data": """{
+              "test_scenarios": {
+                "openai_only": {
+                  "provider": "openai",
+                  "expected_status": 200,
+                  "test_cases": [
+                    {"model": "gpt-4", "endpoint": "/v1/chat/completions", "expected_response": "success"},
+                    {"model": "llama3-70b", "endpoint": "/v1/chat/completions", "expected_response": "unauthorized_model"}
+                  ]
+                },
+                "groq_only": {
+                  "provider": "groq",
+                  "expected_status": 200,
+                  "test_cases": [
+                    {"model": "llama3-70b", "endpoint": "/v1/chat/completions", "expected_response": "success"},
+                    {"model": "gpt-4", "endpoint": "/v1/chat/completions", "expected_response": "unauthorized_model"}
+                  ]
+                }
+              }
+            }"""
+        }
+    }
+
+    # Save YAML file
+    with open("api_key.yaml", "w") as f:
+        yaml.dump(data, f, sort_keys=False)
+
+    return {"message": "API key file created successfully", "file": "api_key.yaml"}
