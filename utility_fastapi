@@ -7,21 +7,38 @@ import os
 import uvicorn
 import re
 from typing import List, Dict, Any
+from enum import Enum
 
 app = FastAPI(title="Session Management API", version="1.0.0")
+
+# Environment and Project enums
+class Environment(str, Enum):
+    DEV = "Dev"
+    UAT = "UAT"
+    PROD = "PROD"
+
+class Project(str, Enum):
+    A = "A"
+    B = "B"
 
 # Pydantic models for request/response
 class LaunchSessionRequest(BaseModel):
     session_name: str = "My JupyterLab Session-1"
     workbench: str = "JupyterLab"
     cluster: str = "Local"
-    base_url: str = Field(..., description="Base URL for the API (without https://)")
+    env: Environment = Field(..., description="Environment: Dev, UAT, or PROD")
+    project: Project = Field(..., description="Project: A or B")
 
 class StopSessionRequest(BaseModel):
     session_ids: List[str]
     force_quit: bool = False
     suspend_session: bool = False
-    base_url: str = Field(..., description="Base URL for the API (without https://)")
+    env: Environment = Field(..., description="Environment: Dev, UAT, or PROD")
+    project: Project = Field(..., description="Project: A or B")
+
+class GetSessionsRequest(BaseModel):
+    env: Environment = Field(..., description="Environment: Dev, UAT, or PROD")
+    project: Project = Field(..., description="Project: A or B")
 
 class LaunchSessionResponse(BaseModel):
     success: bool
@@ -48,7 +65,7 @@ class StopSessionResponse(BaseModel):
     error: str = None
 
 class TokenResponse(BaseModel):
-    username: str
+    user_id: str
     token: str = None
     available_users: List[str] = []
 
@@ -60,6 +77,26 @@ LAUNCH_API = "/api/launch_session"
 GET_SESSION_API = "/api/get_session"
 STOP_SESSION_API = "/api/stop_session"
 
+# Environment to base URL mapping
+ENV_PROJECT_MAP = {
+    Environment.DEV: {
+        Project.A: "dev-a.example.com",
+        Project.B: "dev-b.example.com"
+    },
+    Environment.UAT: {
+        Project.A: "uat-a.example.com",
+        Project.B: "uat-b.example.com"
+    },
+    Environment.PROD: {
+        Project.A: "prod-a.example.com",
+        Project.B: "prod-b.example.com"
+    }
+}
+
+def get_base_url(env: Environment, project: Project) -> str:
+    """Get base URL based on environment and project"""
+    return ENV_PROJECT_MAP.get(env, {}).get(project, "unknown.example.com")
+
 def format_base_url(base_url: str) -> str:
     """Format base URL to ensure it has https:// prefix"""
     if not base_url.startswith(('http://', 'https://')):
@@ -67,7 +104,7 @@ def format_base_url(base_url: str) -> str:
     return base_url
 
 # Helper functions
-def get_token_from_json(username: str, filename: str = "tokens.json") -> str:
+def get_token_from_json(user_id: str, filename: str = "tokens.json") -> str:
     """Read token from JSON file based on user ID"""
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -75,9 +112,9 @@ def get_token_from_json(username: str, filename: str = "tokens.json") -> str:
         
         with open(token_file_path, 'r') as file:
             tokens = json.load(file)
-            token = tokens.get(username)
+            token = tokens.get(user_id)
             if not token:
-                raise HTTPException(status_code=404, detail=f"Token not found for user: {username}")
+                raise HTTPException(status_code=404, detail=f"Token not found for user: {user_id}")
             return token
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Token file '{filename}' not found")
@@ -96,10 +133,10 @@ def get_available_users(filename: str = "tokens.json") -> List[str]:
     except (FileNotFoundError, json.JSONDecodeError):
         return []
 
-def get_user_token(username: str) -> tuple[str, str]:
-    """Centralized function to get user ID and token - username is mandatory"""
-    token = get_token_from_json(username)
-    return username, token
+def get_user_token(x_user_id: str) -> tuple[str, str]:
+    """Centralized function to get user ID and token - user_id is mandatory"""
+    token = get_token_from_json(x_user_id)
+    return x_user_id, token
 
 async def make_api_request(base_url: str, api_endpoint: str, payload: dict, token: str) -> Dict[str, Any]:
     """Make API request to external service"""
@@ -224,22 +261,32 @@ async def root():
         "message": "Session Management API",
         "version": "1.0.0",
         "endpoints": {
-            "GET /tokens/{username}": "Get token for a specific user",
-            "POST /launch-session": "Launch a new session (requires X-User-ID header and base_url in body)",
-            "GET /sessions": "Get all sessions for a user (requires X-User-ID header and base_url in query)",
-            "POST /stop-session": "Stop/kill one or more sessions (requires X-User-ID header and base_url in body)",
-            "GET /available-users": "Get list of available users"
+            "GET /tokens/{user_id}": "Get token for a specific user",
+            "POST /launch-session": "Launch a new session (requires X-User-ID header, env and project in body)",
+            "GET /sessions": "Get all sessions for a user (requires X-User-ID header, env and project in query)",
+            "POST /stop-session": "Stop/kill one or more sessions (requires X-User-ID header, env and project in body)",
+            "GET /available-users": "Get list of available users",
+            "GET /env-projects": "Get available environment and project combinations"
         }
     }
 
-@app.get("/tokens/{username}", response_model=TokenResponse)
-async def get_token(username: str):
+@app.get("/env-projects")
+async def get_env_projects():
+    """Get available environment and project combinations"""
+    return {
+        "environments": [env.value for env in Environment],
+        "projects": [project.value for project in Project],
+        "mappings": ENV_PROJECT_MAP
+    }
+
+@app.get("/tokens/{user_id}", response_model=TokenResponse)
+async def get_token(user_id: str):
     """Get token for a specific user"""
-    token = get_token_from_json(username)
+    token = get_token_from_json(user_id)
     available_users = get_available_users()
     
     return TokenResponse(
-        username=username,
+        user_id=user_id,
         token=token,
         available_users=available_users
     )
@@ -253,23 +300,24 @@ async def get_available_users_endpoint():
 @app.post("/launch-session", response_model=LaunchSessionResponse)
 async def launch_session_endpoint(
     request: LaunchSessionRequest,
-    username: str = Header(..., description="User ID to look up token from tokens.json")
+    x_user_id: str = Header(..., description="User ID to look up token from tokens.json")
 ):
     """Launch a session with the provided parameters"""
-    username, token = get_user_token(username)
+    user_id, token = get_user_token(x_user_id)
+    base_url = get_base_url(request.env, request.project)
 
     try:
         response_data = await launch_session_api(
-            base_url=request.base_url,
+            base_url=base_url,
             token=token,
             session_name=request.session_name,
             workbench=request.workbench,
             cluster=request.cluster,
-            username=username
+            username=user_id
         )
 
         if response_data and "result" in response_data and "url" in response_data["result"]:
-            formatted_base_url = format_base_url(request.base_url)
+            formatted_base_url = format_base_url(base_url)
             full_url = formatted_base_url + response_data["result"]["url"]
             return LaunchSessionResponse(
                 success=True,
@@ -294,11 +342,13 @@ async def launch_session_endpoint(
 
 @app.get("/sessions", response_model=GetSessionsResponse)
 async def get_sessions_endpoint(
-    username: str = Header(..., description="User ID to look up token from tokens.json"),
-    base_url: str = Header(..., description="Base URL for the API (without https://)")
+    x_user_id: str = Header(..., description="User ID to look up token from tokens.json"),
+    env: Environment = Header(..., description="Environment: Dev, UAT, or PROD"),
+    project: Project = Header(..., description="Project: A or B")
 ):
     """Get all sessions for a user"""
-    username, token = get_user_token(username)
+    user_id, token = get_user_token(x_user_id)
+    base_url = get_base_url(env, project)
 
     try:
         response_data = await get_sessions_api(base_url, token)
@@ -333,14 +383,15 @@ async def get_sessions_endpoint(
 @app.post("/stop-session", response_model=StopSessionResponse)
 async def stop_session_endpoint(
     request: StopSessionRequest,
-    username: str = Header(..., description="User ID to look up token from tokens.json")
+    x_user_id: str = Header(..., description="User ID to look up token from tokens.json")
 ):
     """Stop/kill one or more sessions"""
-    username, token = get_user_token(username)
+    user_id, token = get_user_token(x_user_id)
+    base_url = get_base_url(request.env, request.project)
 
     try:
         response_data = await stop_session_api(
-            base_url=request.base_url,
+            base_url=base_url,
             token=token,
             session_ids=request.session_ids,
             force_quit=request.force_quit,
