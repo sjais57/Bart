@@ -1,66 +1,88 @@
-async def stop_session_api(token: str, session_ids: List[str], force_quit: bool = False, suspend_session: bool = False) -> Dict[str, Any]:
-    """Stop/kill sessions using the provided API"""
-    # Convert session_ids list to comma-separated string for the external API
-    session_ids_str = ",".join(session_ids)
-    
-    payload = {
-        "method": "stop_session",
-        "kwparams": {
-            "session_ids": session_ids_str,  # Send as string
-            "force_quit": force_quit,
-            "suspend_session": suspend_session
-        }
-    }
-    
-    response_data = await make_api_request(STOP_SESSION_API, payload, token)
-    
-    # Debug logging to see actual response structure
-    print(f"Stop session API response: {response_data}")
-    
-    return response_data
-
-@app.post("/stop-session", response_model=StopSessionResponse)
-async def stop_session_endpoint(
-    request: StopSessionRequest,
-    x_user_id: str = Header(..., description="User ID to look up token from tokens.json")
-):
-    """Stop/kill one or more sessions"""
-    user_id, token = get_user_token(x_user_id)
-
-    try:
-        response_data = await stop_session_api(
-            token=token,
-            session_ids=request.session_ids,
-            force_quit=request.force_quit,
-            suspend_session=request.suspend_session
-        )
-
-        # For stop session, we primarily care about HTTP status code
-        # The external API might return empty or non-JSON response on success
-        # So we consider HTTP 200 as success regardless of response content
-        
-        # If we got this far without exception, the request was successful
-        # (make_api_request raises exceptions for non-2xx status codes)
-        return StopSessionResponse(
-            success=True,
-            message=f"Successfully stopped {len(request.session_ids)} sessions",
-            stopped_sessions=request.session_ids
-        )
-            
-    except HTTPException as e:
-        # Re-raise HTTP exceptions to maintain proper status codes
-        raise e
-    except requests.exceptions.RequestException as e:
-        print(f"Request error: {e}")
-        return StopSessionResponse(
-            success=False,
-            message="Failed to connect to external API",
-            error=str(e)
-        )
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-        return StopSessionResponse(
-            success=False,
-            message="Failed to stop sessions",
-            error=str(e)
-        )
+diff --git a/app_jwt.py b/app_jwt.py
+--- a/app_jwt.py
++++ b/app_jwt.py
+@@
+-import os
++import os
++import re
+ from datetime import timedelta, datetime
+ from flask import Flask, jsonify, request, make_response, render_template, send_from_directory
+@@
+ app.register_blueprint(swaggerui_blueprint, url_prefix=SWAGGER_URL)
+@@
+ app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "dev-secret-key")
+ 
++def _extract_group_cns(groups):
++    """
++    Normalize LDAP groups to a flat list of CNs (lowercased).
++    Accepts:
++      - list of DNs: 'cn=Admins,ou=groups,dc=ex,dc=com'
++      - list of dicts: {'cn': 'Admins', ...}
++      - plain names: 'Admins'
++    """
++    result = []
++    for g in (groups or []):
++        if isinstance(g, dict):
++            cn = g.get('cn') or g.get('name') or g.get('uid') or ''
++            if cn:
++                result.append(cn.lower())
++        elif isinstance(g, str):
++            m = re.search(r'cn=([^,]+)', g, flags=re.I)
++            result.append((m.group(1) if m else g).lower())
++    # de-dup while preserving order
++    seen, ordered = set(), []
++    for n in result:
++        if n not in seen:
++            seen.add(n)
++            ordered.append(n)
++    return ordered
++
+@@
+ def login():
+@@
+-    # Create user context for dynamic claims processing
+-    user_context = {
+-        "user_id": username,
+-        "email": user_data.get("email", ""),
+-        "groups": user_data.get("groups", []),
+-        "roles": user_data.get("roles", []),
+-        "team_id": get_team_id_from_user(username, user_data)
+-    }
++    # Normalize groups to CNs for consistent matching everywhere
++    raw_groups = user_data.get("groups", [])
++    normalized_groups = _extract_group_cns(raw_groups)
++
++    # Create user context for dynamic claims processing
++    user_context = {
++        "user_id": username,
++        "email": user_data.get("email", ""),
++        "groups": normalized_groups,
++        "roles": user_data.get("roles", []),
++        "team_id": get_team_id_from_user(username, dict(user_data, groups=normalized_groups))
++    }
+@@
+-        user_context = {
++        user_context = {
+             "user_id": username,
+-            "team_id": get_team_id_from_user(username, user_data),
+-            "groups": user_data.get("groups", []),  # Ensure groups is included for dynamic claims
++            "team_id": get_team_id_from_user(username, dict(user_data, groups=normalized_groups)),
++            "groups": normalized_groups,  # pass CNs to dynamic claims
+             "api_key_id": api_key  # Use the API key itself as an ID if needed
+         }
+@@
+-    # Merge user data with additional claims
+-    claims = {**user_data, **api_key_claims}
++    # Merge user data with additional claims
++    claims = {**user_data, **api_key_claims}
++    # Ensure the 'groups' claim contains CNs only (for policy matching)
++    claims["groups"] = normalized_groups
++    # (optional) include raw groups for debugging/traceability
++    claims["groups_raw"] = raw_groups
+@@
+ def get_team_id_from_user(username, user_data):
+@@
+-    # Simple mapping based on groups
+-    groups = user_data.get("groups", [])
++    # Simple mapping based on groups (already normalized to CNs where possible)
++    groups = _extract_group_cns(user_data.get("groups", []))
