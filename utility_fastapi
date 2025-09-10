@@ -6,7 +6,7 @@ import getpass
 import os
 import uvicorn
 import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from enum import Enum
 
 app = FastAPI(title="Session Management API", version="1.0.0")
@@ -18,8 +18,8 @@ class Environment(str, Enum):
     PROD = "PROD"
 
 class Project(str, Enum):
-    A = "A"
-    B = "B"
+    PROJECT1 = "PROJECT1"
+    PROJECT2 = "PROJECT2"
 
 # Pydantic models for request/response
 class LaunchSessionRequest(BaseModel):
@@ -27,18 +27,15 @@ class LaunchSessionRequest(BaseModel):
     workbench: str = "JupyterLab"
     cluster: str = "Local"
     env: Environment = Field(..., description="Environment: Dev, UAT, or PROD")
-    project: Project = Field(..., description="Project: A or B")
+    project: Project = Field(..., description="Project: PROJECT1 or PROJECT2")
 
 class StopSessionRequest(BaseModel):
-    session_ids: List[str]
+    session_names: Optional[List[str]] = Field(None, description="List of session display names to stop")
+    session_ids: Optional[List[str]] = Field(None, description="List of session IDs to stop")
     force_quit: bool = False
     suspend_session: bool = False
     env: Environment = Field(..., description="Environment: Dev, UAT, or PROD")
-    project: Project = Field(..., description="Project: A or B")
-
-class GetSessionsRequest(BaseModel):
-    env: Environment = Field(..., description="Environment: Dev, UAT, or PROD")
-    project: Project = Field(..., description="Project: A or B")
+    project: Project = Field(..., description="Project: PROJECT1 or PROJECT2")
 
 class LaunchSessionResponse(BaseModel):
     success: bool
@@ -80,16 +77,16 @@ STOP_SESSION_API = "/api/stop_session"
 # Environment to base URL mapping
 ENV_PROJECT_MAP = {
     Environment.DEV: {
-        Project.A: "dev-a.example.com",
-        Project.B: "dev-b.example.com"
+        Project.PROJECT1: "dev-project1.example.com",
+        Project.PROJECT2: "dev-project2.example.com"
     },
     Environment.UAT: {
-        Project.A: "uat-a.example.com",
-        Project.B: "uat-b.example.com"
+        Project.PROJECT1: "uat-project1.example.com",
+        Project.PROJECT2: "uat-project2.example.com"
     },
     Environment.PROD: {
-        Project.A: "prod-a.example.com",
-        Project.B: "prod-b.example.com"
+        Project.PROJECT1: "prod-project1.example.com",
+        Project.PROJECT2: "prod-project2.example.com"
     }
 }
 
@@ -253,6 +250,29 @@ async def launch_session_api(base_url: str, token: str, session_name: str, workb
     
     return await make_api_request(base_url, LAUNCH_API, payload, token)
 
+def find_session_ids_by_names(sessions: List[SessionInfo], session_names: List[str]) -> List[str]:
+    """Find session IDs by their display names"""
+    session_ids = []
+    not_found_names = []
+    
+    for name in session_names:
+        found = False
+        for session in sessions:
+            if session.display_name == name:
+                session_ids.append(session.session_id)
+                found = True
+                break
+        if not found:
+            not_found_names.append(name)
+    
+    if not_found_names:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Sessions not found: {', '.join(not_found_names)}"
+        )
+    
+    return session_ids
+
 # Endpoints
 @app.get("/")
 async def root():
@@ -279,7 +299,7 @@ async def get_env_projects():
         "mappings": ENV_PROJECT_MAP
     }
 
-@app.get("/tokens/{user_id}", response_model=TokenResponse)
+@app.get("/tokens/{user_id", response_model=TokenResponse)
 async def get_token(user_id: str):
     """Get token for a specific user"""
     token = get_token_from_json(user_id)
@@ -344,7 +364,7 @@ async def launch_session_endpoint(
 async def get_sessions_endpoint(
     x_user_id: str = Header(..., description="User ID to look up token from tokens.json"),
     env: Environment = Header(..., description="Environment: Dev, UAT, or PROD"),
-    project: Project = Header(..., description="Project: A or B")
+    project: Project = Header(..., description="Project: PROJECT1 or PROJECT2")
 ):
     """Get all sessions for a user"""
     user_id, token = get_user_token(x_user_id)
@@ -385,15 +405,49 @@ async def stop_session_endpoint(
     request: StopSessionRequest,
     x_user_id: str = Header(..., description="User ID to look up token from tokens.json")
 ):
-    """Stop/kill one or more sessions"""
+    """Stop/kill one or more sessions by session_ids or session_names"""
     user_id, token = get_user_token(x_user_id)
     base_url = get_base_url(request.env, request.project)
 
+    # Validate that at least one of session_ids or session_names is provided
+    if not request.session_ids and not request.session_names:
+        raise HTTPException(
+            status_code=400,
+            detail="Either session_ids or session_names must be provided"
+        )
+
     try:
+        # If session_names are provided, first get all sessions to find the corresponding IDs
+        session_ids_to_stop = request.session_ids or []
+        
+        if request.session_names:
+            # Get all sessions to find the IDs for the given names
+            sessions_response = await get_sessions_api(base_url, token)
+            if sessions_response and "result" in sessions_response and "sessions" in sessions_response["result"]:
+                sessions = []
+                for session_data in sessions_response["result"]["sessions"]:
+                    session_info = extract_session_info(base_url, session_data)
+                    sessions.append(session_info)
+                
+                # Find session IDs by names
+                found_session_ids = find_session_ids_by_names(sessions, request.session_names)
+                session_ids_to_stop.extend(found_session_ids)
+            else:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Could not retrieve sessions to find session names"
+                )
+
+        if not session_ids_to_stop:
+            raise HTTPException(
+                status_code=400,
+                detail="No valid session IDs found to stop"
+            )
+
         response_data = await stop_session_api(
             base_url=base_url,
             token=token,
-            session_ids=request.session_ids,
+            session_ids=session_ids_to_stop,
             force_quit=request.force_quit,
             suspend_session=request.suspend_session
         )
@@ -401,8 +455,8 @@ async def stop_session_endpoint(
         if response_data:
             return StopSessionResponse(
                 success=True,
-                message=f"Successfully stopped {len(request.session_ids)} sessions",
-                stopped_sessions=request.session_ids
+                message=f"Successfully stopped {len(session_ids_to_stop)} sessions",
+                stopped_sessions=session_ids_to_stop
             )
         else:
             return StopSessionResponse(
