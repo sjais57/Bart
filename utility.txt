@@ -1,88 +1,495 @@
-diff --git a/app_jwt.py b/app_jwt.py
---- a/app_jwt.py
-+++ b/app_jwt.py
-@@
--import os
-+import os
-+import re
- from datetime import timedelta, datetime
- from flask import Flask, jsonify, request, make_response, render_template, send_from_directory
-@@
- app.register_blueprint(swaggerui_blueprint, url_prefix=SWAGGER_URL)
-@@
- app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "dev-secret-key")
- 
-+def _extract_group_cns(groups):
-+    """
-+    Normalize LDAP groups to a flat list of CNs (lowercased).
-+    Accepts:
-+      - list of DNs: 'cn=Admins,ou=groups,dc=ex,dc=com'
-+      - list of dicts: {'cn': 'Admins', ...}
-+      - plain names: 'Admins'
-+    """
-+    result = []
-+    for g in (groups or []):
-+        if isinstance(g, dict):
-+            cn = g.get('cn') or g.get('name') or g.get('uid') or ''
-+            if cn:
-+                result.append(cn.lower())
-+        elif isinstance(g, str):
-+            m = re.search(r'cn=([^,]+)', g, flags=re.I)
-+            result.append((m.group(1) if m else g).lower())
-+    # de-dup while preserving order
-+    seen, ordered = set(), []
-+    for n in result:
-+        if n not in seen:
-+            seen.add(n)
-+            ordered.append(n)
-+    return ordered
-+
-@@
- def login():
-@@
--    # Create user context for dynamic claims processing
--    user_context = {
--        "user_id": username,
--        "email": user_data.get("email", ""),
--        "groups": user_data.get("groups", []),
--        "roles": user_data.get("roles", []),
--        "team_id": get_team_id_from_user(username, user_data)
--    }
-+    # Normalize groups to CNs for consistent matching everywhere
-+    raw_groups = user_data.get("groups", [])
-+    normalized_groups = _extract_group_cns(raw_groups)
-+
-+    # Create user context for dynamic claims processing
-+    user_context = {
-+        "user_id": username,
-+        "email": user_data.get("email", ""),
-+        "groups": normalized_groups,
-+        "roles": user_data.get("roles", []),
-+        "team_id": get_team_id_from_user(username, dict(user_data, groups=normalized_groups))
-+    }
-@@
--        user_context = {
-+        user_context = {
-             "user_id": username,
--            "team_id": get_team_id_from_user(username, user_data),
--            "groups": user_data.get("groups", []),  # Ensure groups is included for dynamic claims
-+            "team_id": get_team_id_from_user(username, dict(user_data, groups=normalized_groups)),
-+            "groups": normalized_groups,  # pass CNs to dynamic claims
-             "api_key_id": api_key  # Use the API key itself as an ID if needed
-         }
-@@
--    # Merge user data with additional claims
--    claims = {**user_data, **api_key_claims}
-+    # Merge user data with additional claims
-+    claims = {**user_data, **api_key_claims}
-+    # Ensure the 'groups' claim contains CNs only (for policy matching)
-+    claims["groups"] = normalized_groups
-+    # (optional) include raw groups for debugging/traceability
-+    claims["groups_raw"] = raw_groups
-@@
- def get_team_id_from_user(username, user_data):
-@@
--    # Simple mapping based on groups
--    groups = user_data.get("groups", [])
-+    # Simple mapping based on groups (already normalized to CNs where possible)
-+    groups = _extract_group_cns(user_data.get("groups", []))
+from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel, Field
+import requests
+import json
+import getpass
+import os
+import uvicorn
+import re
+from typing import List, Dict, Any, Optional
+from enum import Enum
+
+app = FastAPI(title="Session Management API", version="1.0.0")
+
+# Environment and Project enums
+class Environment(str, Enum):
+    DEV = "Dev"
+    UAT = "UAT"
+    PROD = "PROD"
+
+class Project(str, Enum):
+    PROJECT1 = "PROJECT1"
+    PROJECT2 = "PROJECT2"
+
+# Pydantic models for request/response
+class LaunchSessionRequest(BaseModel):
+    session_name: Optional[str] = Field(None, description="Optional custom session name. If not provided, will generate automatically")
+    workbench: str = "JupyterLab"
+    cluster: str = "Local"
+    env: Environment = Field(..., description="Environment: Dev, UAT, or PROD")
+    project: Project = Field(..., description="Project: PROJECT1 or PROJECT2")
+
+class StopSessionRequest(BaseModel):
+    session_names: Optional[List[str]] = Field(None, description="List of session display names to stop")
+    session_ids: Optional[List[str]] = Field(None, description="List of session IDs to stop")
+    force_quit: bool = False
+    suspend_session: bool = False
+    env: Environment = Field(..., description="Environment: Dev, UAT, or PROD")
+    project: Project = Field(..., description="Project: PROJECT1 or PROJECT2")
+
+class LaunchSessionResponse(BaseModel):
+    success: bool
+    message: str
+    session_url: str = None
+    session_name: str = None
+    error: str = None
+
+class SessionInfo(BaseModel):
+    session_id: str
+    url: str
+    session_name: str
+    display_name: str
+
+class GetSessionsResponse(BaseModel):
+    success: bool
+    message: str
+    sessions: List[SessionInfo] = []
+    error: str = None
+
+class StopSessionResponse(BaseModel):
+    success: bool
+    message: str
+    stopped_sessions: List[str] = []
+    error: str = None
+
+class TokenResponse(BaseModel):
+    user_id: str
+    token: str = None
+    available_users: List[str] = []
+
+class AvailableUsersResponse(BaseModel):
+    available_users: List[str]
+
+# API endpoints (relative paths)
+LAUNCH_API = "/api/launch_session"
+GET_SESSION_API = "/api/get_session"
+STOP_SESSION_API = "/api/stop_session"
+
+# Environment to base URL mapping
+ENV_PROJECT_MAP = {
+    Environment.DEV: {
+        Project.PROJECT1: "dev-project1.example.com",
+        Project.PROJECT2: "dev-project2.example.com"
+    },
+    Environment.UAT: {
+        Project.PROJECT1: "uat-project1.example.com",
+        Project.PROJECT2: "uat-project2.example.com"
+    },
+    Environment.PROD: {
+        Project.PROJECT1: "prod-project1.example.com",
+        Project.PROJECT2: "prod-project2.example.com"
+    }
+}
+
+def get_base_url(env: Environment, project: Project) -> str:
+    """Get base URL based on environment and project"""
+    return ENV_PROJECT_MAP.get(env, {}).get(project, "unknown.example.com")
+
+def format_base_url(base_url: str) -> str:
+    """Format base URL to ensure it has https:// prefix"""
+    if not base_url.startswith(('http://', 'https://')):
+        return f"https://{base_url}"
+    return base_url
+
+# Helper functions
+def get_token_from_json(user_id: str, filename: str = "tokens.json") -> str:
+    """Read token from JSON file based on user ID"""
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        token_file_path = os.path.join(script_dir, filename)
+        
+        with open(token_file_path, 'r') as file:
+            tokens = json.load(file)
+            token = tokens.get(user_id)
+            if not token:
+                raise HTTPException(status_code=404, detail=f"Token not found for user: {user_id}")
+            return token
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Token file '{filename}' not found")
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail=f"Error parsing JSON file '{filename}'")
+
+def get_available_users(filename: str = "tokens.json") -> List[str]:
+    """Get list of available users from tokens file"""
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        token_file_path = os.path.join(script_dir, filename)
+        
+        with open(token_file_path, 'r') as file:
+            tokens = json.load(file)
+            return list(tokens.keys())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def get_user_token(x_user_id: str) -> tuple[str, str]:
+    """Centralized function to get user ID and token - user_id is mandatory"""
+    token = get_token_from_json(x_user_id)
+    return x_user_id, token
+
+async def make_api_request(base_url: str, api_endpoint: str, payload: dict, token: str) -> Dict[str, Any]:
+    """Make API request to external service"""
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {token}'
+    }
+
+    try:
+        formatted_base_url = format_base_url(base_url)
+        response = requests.request("POST", formatted_base_url + api_endpoint, 
+                                  headers=headers, data=json.dumps(payload), verify=False)
+        response.raise_for_status()
+        return json.loads(response.text)
+        
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=500, detail=f"Request to external API failed: {e}")
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to parse response JSON: {e}")
+
+async def get_sessions_api(base_url: str, token: str) -> Dict[str, Any]:
+    """Get sessions using the provided API"""
+    payload = {
+        "method": "get_session"
+    }
+    
+    return await make_api_request(base_url, GET_SESSION_API, payload, token)
+
+async def stop_session_api(base_url: str, token: str, session_ids: List[str], force_quit: bool = False, suspend_session: bool = False) -> Dict[str, Any]:
+    """Stop/kill sessions using the provided API"""
+    # Convert session_ids list to comma-separated string for the external API
+    session_ids_str = ",".join(session_ids)
+    
+    payload = {
+        "method": "stop_session",
+        "kwparams": {
+            "session_ids": session_ids_str,  # Send as string
+            "force_quit": force_quit,
+            "suspend_session": suspend_session
+        }
+    }
+    
+    return await make_api_request(base_url, STOP_SESSION_API, payload, token)
+
+def extract_session_info(base_url: str, session_data: Dict[str, Any]) -> SessionInfo:
+    """Extract session information from the API response"""
+    display_name = session_data.get("display_name", "")
+    
+    if not display_name:
+        display_name = session_data.get("name", session_data.get("session_name", ""))
+    
+    formatted_base_url = format_base_url(base_url)
+    return SessionInfo(
+        session_id=session_data.get("id", ""),
+        url=formatted_base_url + session_data.get("url", ""),
+        session_name=display_name,
+        display_name=display_name
+    )
+
+def get_next_available_session_number(existing_sessions: List[SessionInfo], username: str) -> int:
+    """
+    Find the next available session number by checking existing session names.
+    Pattern: {username}-JL_Session-{number}
+    """
+    pattern = re.compile(rf"^{re.escape(username)}-JL_Session-(\d+)$")
+    used_numbers = set()
+    
+    for session in existing_sessions:
+        match = pattern.match(session.display_name)
+        if match:
+            try:
+                used_numbers.add(int(match.group(1)))
+            except (ValueError, TypeError):
+                continue
+    
+    next_number = 1
+    while next_number in used_numbers:
+        next_number += 1
+    
+    return next_number
+
+async def launch_session_api(base_url: str, token: str, custom_session_name: Optional[str], workbench: str, cluster: str, username: str) -> dict:
+    """Launch a session using the provided API with unique name"""
+    try:
+        sessions_response = await get_sessions_api(base_url, token)
+        existing_sessions = []
+        
+        if sessions_response and "result" in sessions_response and "sessions" in sessions_response["result"]:
+            for session_data in sessions_response["result"]["sessions"]:
+                session_info = extract_session_info(base_url, session_data)
+                existing_sessions.append(session_info)
+        
+        # Use custom session name if provided, otherwise generate one
+        if custom_session_name:
+            unique_session_name = custom_session_name
+        else:
+            next_number = get_next_available_session_number(existing_sessions, username)
+            unique_session_name = f"{username}-JL_Session-{next_number}"
+        
+    except Exception as e:
+        print(f"Error getting existing sessions, using simple naming: {e}")
+        unique_session_name = f"{username}-JL_Session-1"
+    
+    payload = {
+        "method": "launch_session",
+        "kwparams": {
+            "workbench": workbench,
+            "name": unique_session_name,  # Use the actual session name here
+            "launch_parameters": {
+                "name": unique_session_name,
+                "cluster": cluster,
+                "placement_constraints": [],
+                "resource_limits": [],
+                "queues": []
+            }
+        }
+    }
+    
+    return await make_api_request(base_url, LAUNCH_API, payload, token)
+
+def find_session_ids_by_names(sessions: List[SessionInfo], session_names: List[str]) -> List[str]:
+    """Find session IDs by their display names"""
+    session_ids = []
+    not_found_names = []
+    
+    for name in session_names:
+        found = False
+        for session in sessions:
+            if session.display_name == name:
+                session_ids.append(session.session_id)
+                found = True
+                break
+        if not found:
+            not_found_names.append(name)
+    
+    if not_found_names:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Sessions not found: {', '.join(not_found_names)}"
+        )
+    
+    return session_ids
+
+# Endpoints
+@app.get("/")
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "message": "Session Management API",
+        "version": "1.0.0",
+        "endpoints": {
+            "GET /tokens/{user_id}": "Get token for a specific user",
+            "POST /launch-session": "Launch a new session (requires X-User-ID header, env and project in body)",
+            "GET /sessions": "Get all sessions for a user (requires X-User-ID header, env and project in query)",
+            "POST /stop-session": "Stop/kill one or more sessions (requires X-User-ID header, env and project in body)",
+            "GET /available-users": "Get list of available users",
+            "GET /env-projects": "Get available environment and project combinations"
+        }
+    }
+
+@app.get("/env-projects")
+async def get_env_projects():
+    """Get available environment and project combinations"""
+    return {
+        "environments": [env.value for env in Environment],
+        "projects": [project.value for project in Project],
+        "mappings": ENV_PROJECT_MAP
+    }
+
+@app.get("/tokens/{user_id}", response_model=TokenResponse)
+async def get_token(user_id: str):
+    """Get token for a specific user"""
+    token = get_token_from_json(user_id)
+    available_users = get_available_users()
+    
+    return TokenResponse(
+        user_id=user_id,
+        token=token,
+        available_users=available_users
+    )
+
+@app.get("/available-users", response_model=AvailableUsersResponse)
+async def get_available_users_endpoint():
+    """Get list of available users from tokens file"""
+    users = get_available_users()
+    return AvailableUsersResponse(available_users=users)
+
+@app.post("/launch-session", response_model=LaunchSessionResponse)
+async def launch_session_endpoint(
+    request: LaunchSessionRequest,
+    x_user_id: str = Header(..., description="User ID to look up token from tokens.json")
+):
+    """Launch a session with the provided parameters"""
+    user_id, token = get_user_token(x_user_id)
+    base_url = get_base_url(request.env, request.project)
+
+    try:
+        response_data = await launch_session_api(
+            base_url=base_url,
+            token=token,
+            custom_session_name=request.session_name,
+            workbench=request.workbench,
+            cluster=request.cluster,
+            username=user_id
+        )
+
+        if response_data and "result" in response_data and "url" in response_data["result"]:
+            formatted_base_url = format_base_url(base_url)
+            full_url = formatted_base_url + response_data["result"]["url"]
+            
+            # Extract the actual session name that was used
+            actual_session_name = request.session_name
+            if not actual_session_name:
+                # If no custom name was provided, extract from response or generate
+                if "result" in response_data and "name" in response_data["result"]:
+                    actual_session_name = response_data["result"]["name"]
+                else:
+                    # Fallback: generate the name we would have used
+                    actual_session_name = f"{user_id}-JL_Session-1"
+            
+            return LaunchSessionResponse(
+                success=True,
+                message="Session launched successfully",
+                session_url=full_url,
+                session_name=actual_session_name
+            )
+        else:
+            return LaunchSessionResponse(
+                success=False,
+                message="Unexpected response format from external API",
+                error=str(response_data)
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        return LaunchSessionResponse(
+            success=False,
+            message="Failed to launch session",
+            error=str(e)
+        )
+
+@app.get("/sessions", response_model=GetSessionsResponse)
+async def get_sessions_endpoint(
+    x_user_id: str = Header(..., description="User ID to look up token from tokens.json"),
+    env: Environment = Header(..., description="Environment: Dev, UAT, or PROD"),
+    project: Project = Header(..., description="Project: PROJECT1 or PROJECT2")
+):
+    """Get all sessions for a user"""
+    user_id, token = get_user_token(x_user_id)
+    base_url = get_base_url(env, project)
+
+    try:
+        response_data = await get_sessions_api(base_url, token)
+
+        if response_data and "result" in response_data and "sessions" in response_data["result"]:
+            sessions = []
+            for session_data in response_data["result"]["sessions"]:
+                session_info = extract_session_info(base_url, session_data)
+                sessions.append(session_info)
+            
+            return GetSessionsResponse(
+                success=True,
+                message=f"Found {len(sessions)} sessions",
+                sessions=sessions
+            )
+        else:
+            return GetSessionsResponse(
+                success=False,
+                message="No sessions found or unexpected response format",
+                error=str(response_data) if response_data else "Empty response"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        return GetSessionsResponse(
+            success=False,
+            message="Failed to get sessions",
+            error=str(e)
+        )
+
+@app.post("/stop-session", response_model=StopSessionResponse)
+async def stop_session_endpoint(
+    request: StopSessionRequest,
+    x_user_id: str = Header(..., description="User ID to look up token from tokens.json")
+):
+    """Stop/kill one or more sessions by session_ids or session_names"""
+    user_id, token = get_user_token(x_user_id)
+    base_url = get_base_url(request.env, request.project)
+
+    # Validate that at least one of session_ids or session_names is provided
+    if not request.session_ids and not request.session_names:
+        raise HTTPException(
+            status_code=400,
+            detail="Either session_ids or session_names must be provided"
+        )
+
+    try:
+        # If session_names are provided, first get all sessions to find the corresponding IDs
+        session_ids_to_stop = request.session_ids or []
+        
+        if request.session_names:
+            # Get all sessions to find the IDs for the given names
+            sessions_response = await get_sessions_api(base_url, token)
+            if sessions_response and "result" in sessions_response and "sessions" in sessions_response["result"]:
+                sessions = []
+                for session_data in sessions_response["result"]["sessions"]:
+                    session_info = extract_session_info(base_url, session_data)
+                    sessions.append(session_info)
+                
+                # Find session IDs by names
+                found_session_ids = find_session_ids_by_names(sessions, request.session_names)
+                session_ids_to_stop.extend(found_session_ids)
+            else:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Could not retrieve sessions to find session names"
+                )
+
+        if not session_ids_to_stop:
+            raise HTTPException(
+                status_code=400,
+                detail="No valid session IDs found to stop"
+            )
+
+        response_data = await stop_session_api(
+            base_url=base_url,
+            token=token,
+            session_ids=session_ids_to_stop,
+            force_quit=request.force_quit,
+            suspend_session=request.suspend_session
+        )
+
+        if response_data:
+            return StopSessionResponse(
+                success=True,
+                message=f"Successfully stopped {len(session_ids_to_stop)} sessions",
+                stopped_sessions=session_ids_to_stop
+            )
+        else:
+            return StopSessionResponse(
+                success=False,
+                message="Empty response from external API",
+                error="No response data received"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        return StopSessionResponse(
+            success=False,
+            message="Failed to stop sessions",
+            error=str(e)
+        )
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
