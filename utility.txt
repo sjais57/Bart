@@ -28,10 +28,10 @@ class LaunchSessionRequest(BaseModel):
     cluster: str = "Local"
     env: Environment = Field(..., description="Environment: Dev, UAT, or PROD")
     project: Project = Field(..., description="Project: PROJECT1 or PROJECT2")
+    node_selection: Optional[str] = Field(None, description="Node selection for the session (optional for both projects)")
 
 class StopSessionRequest(BaseModel):
-    session_names: Optional[List[str]] = Field(None, description="List of session display names to stop")
-    session_ids: Optional[List[str]] = Field(None, description="List of session IDs to stop")
+    session_ids: List[str] = Field(..., description="List of session IDs to stop")
     force_quit: bool = False
     suspend_session: bool = False
     env: Environment = Field(..., description="Environment: Dev, UAT, or PROD")
@@ -63,7 +63,7 @@ class StopSessionResponse(BaseModel):
     error: str = None
 
 class TokenResponse(BaseModel):
-    user_id: str
+    username: str
     token: str = None
     available_users: List[str] = []
 
@@ -108,7 +108,7 @@ def format_base_url(base_url: str) -> str:
     return base_url
 
 # Helper functions
-def get_token_from_json(user_id: str, filename: str = "tokens.json") -> str:
+def get_token_from_json(username: str, filename: str = "tokens.json") -> str:
     """Read token from JSON file based on user ID"""
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -116,9 +116,9 @@ def get_token_from_json(user_id: str, filename: str = "tokens.json") -> str:
         
         with open(token_file_path, 'r') as file:
             tokens = json.load(file)
-            token = tokens.get(user_id)
+            token = tokens.get(username)
             if not token:
-                raise HTTPException(status_code=404, detail=f"Token not found for user: {user_id}")
+                raise HTTPException(status_code=404, detail=f"Token not found for user: {username}")
             return token
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Token file '{filename}' not found")
@@ -137,10 +137,10 @@ def get_available_users(filename: str = "tokens.json") -> List[str]:
     except (FileNotFoundError, json.JSONDecodeError):
         return []
 
-def get_user_token(x_user_id: str) -> tuple[str, str]:
-    """Centralized function to get user ID and token - user_id is mandatory"""
-    token = get_token_from_json(x_user_id)
-    return x_user_id, token
+def get_user_token(username: str) -> tuple[str, str]:
+    """Centralized function to get user ID and token - username is mandatory"""
+    token = get_token_from_json(username)
+    return username, token
 
 async def make_api_request(base_url: str, api_endpoint: str, payload: dict, token: str) -> Dict[str, Any]:
     """Make API request to external service"""
@@ -160,6 +160,33 @@ async def make_api_request(base_url: str, api_endpoint: str, payload: dict, toke
         raise HTTPException(status_code=500, detail=f"Request to external API failed: {e}")
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=500, detail=f"Failed to parse response JSON: {e}")
+
+async def validate_node_selection(base_url: str, node_selection: str, username: str, token: str) -> bool:
+    """Validate node selection by making the node selection API call"""
+    try:
+        # Construct the node selection URL
+        node_url = f"https://{base_url}:8084/cluster/{node_selection}/user/{username}"
+        
+        headers = {
+            'Authorization': f'Bearer {token}'
+        }
+        
+        response = requests.request("GET", node_url, headers=headers, verify=False)
+        response.raise_for_status()
+        
+        # If we get here, the node selection was successful
+        return True
+        
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Node selection failed for node '{node_selection}': {str(e)}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error during node selection: {str(e)}"
+        )
 
 async def get_sessions_api(base_url: str, token: str) -> Dict[str, Any]:
     """Get sessions using the provided API"""
@@ -222,7 +249,7 @@ def get_next_available_session_number(existing_sessions: List[SessionInfo]) -> i
     
     return next_number
 
-async def launch_session_api(base_url: str, token: str, custom_session_name: Optional[str], workbench: str, cluster: str) -> dict:
+async def launch_session_api(base_url: str, token: str, custom_session_name: Optional[str], workbench: str, cluster: str, node_selection: Optional[str]) -> tuple[dict, str]:
     """Launch a session using the provided API with unique name"""
     try:
         sessions_response = await get_sessions_api(base_url, token)
@@ -244,45 +271,30 @@ async def launch_session_api(base_url: str, token: str, custom_session_name: Opt
         print(f"Error getting existing sessions, using simple naming: {e}")
         unique_session_name = f"JupyterLab Session 1"
     
+    # Prepare launch parameters
+    launch_parameters = {
+        "name": unique_session_name,
+        "cluster": cluster,
+        "placement_constraints": [],
+        "resource_limits": [],
+        "queues": []
+    }
+    
+    # Add node selection only if provided
+    if node_selection:
+        launch_parameters["node_selection"] = node_selection
+    
     payload = {
         "method": "launch_session",
         "kwparams": {
             "workbench": workbench,
             "name": unique_session_name,
-            "launch_parameters": {
-                "name": unique_session_name,
-                "cluster": cluster,
-                "placement_constraints": [],
-                "resource_limits": [],
-                "queues": []
-            }
+            "launch_parameters": launch_parameters
         }
     }
     
-    return await make_api_request(base_url, LAUNCH_API, payload, token)
-
-def find_session_ids_by_names(sessions: List[SessionInfo], session_names: List[str]) -> List[str]:
-    """Find session IDs by their display names"""
-    session_ids = []
-    not_found_names = []
-    
-    for name in session_names:
-        found = False
-        for session in sessions:
-            if session.display_name == name:
-                session_ids.append(session.session_id)
-                found = True
-                break
-        if not found:
-            not_found_names.append(name)
-    
-    if not_found_names:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Sessions not found: {', '.join(not_found_names)}"
-        )
-    
-    return session_ids
+    response_data = await make_api_request(base_url, LAUNCH_API, payload, token)
+    return response_data, unique_session_name
 
 # Endpoints
 @app.get("/")
@@ -292,8 +304,8 @@ async def root():
         "message": "Session Management API",
         "version": "1.0.0",
         "endpoints": {
-            "GET /tokens/{user_id}": "Get token for a specific user",
-            "POST /launch-session": "Launch a new session (requires X-User-ID header, env and project in body)",
+            "GET /tokens/{username}": "Get token for a specific user",
+            "POST /launch-session": "Launch a new session (requires X-User-ID header, env, project in body; node_selection optional)",
             "GET /sessions": "Get all sessions for a user (requires X-User-ID header, env and project in query params)",
             "POST /stop-session": "Stop/kill one or more sessions (requires X-User-ID header, env and project in body)",
             "GET /available-users": "Get list of available users",
@@ -310,14 +322,14 @@ async def get_env_projects():
         "mappings": ENV_PROJECT_MAP
     }
 
-@app.get("/tokens/{user_id}", response_model=TokenResponse)
-async def get_token(user_id: str):
+@app.get("/tokens/{username}", response_model=TokenResponse)
+async def get_token(username: str):
     """Get token for a specific user"""
-    token = get_token_from_json(user_id)
+    token = get_token_from_json(username)
     available_users = get_available_users()
     
     return TokenResponse(
-        user_id=user_id,
+        username=username,
         token=token,
         available_users=available_users
     )
@@ -331,34 +343,40 @@ async def get_available_users_endpoint():
 @app.post("/launch-session", response_model=LaunchSessionResponse)
 async def launch_session_endpoint(
     request: LaunchSessionRequest,
-    x_user_id: str = Header(..., description="User ID to look up token from tokens.json")
+    username: str = Header(..., description="User ID to look up token from tokens.json")
 ):
     """Launch a session with the provided parameters"""
-    user_id, token = get_user_token(x_user_id)
+    username, token = get_user_token(username)
     base_url = get_base_url(request.env, request.project)
 
+    # Handle node selection logic
+    final_node_selection = request.node_selection
+    
+    # For PROJECT1, if no node_selection provided, use "N" as default
+    if request.project == Project.PROJECT1 and not request.node_selection:
+        final_node_selection = "N"
+    
+    # For PROJECT2, ignore any node_selection provided by user
+    if request.project == Project.PROJECT2:
+        final_node_selection = None
+
     try:
-        response_data = await launch_session_api(
+        # For PROJECT1, validate node selection if provided (including default "N")
+        if request.project == Project.PROJECT1 and final_node_selection:
+            await validate_node_selection(base_url, final_node_selection, username, token)
+
+        response_data, actual_session_name = await launch_session_api(
             base_url=base_url,
             token=token,
             custom_session_name=request.session_name,
             workbench=request.workbench,
-            cluster=request.cluster
+            cluster=request.cluster,
+            node_selection=final_node_selection
         )
 
         if response_data and "result" in response_data and "url" in response_data["result"]:
             formatted_base_url = format_base_url(base_url)
             full_url = formatted_base_url + response_data["result"]["url"]
-            
-            # Extract the actual session name that was used
-            actual_session_name = request.session_name
-            if not actual_session_name:
-                # If no custom name was provided, extract from response or generate
-                if "result" in response_data and "name" in response_data["result"]:
-                    actual_session_name = response_data["result"]["name"]
-                else:
-                    # Fallback: generate the name we would have used
-                    actual_session_name = f"JupyterLab Session 1"
             
             return LaunchSessionResponse(
                 success=True,
@@ -384,12 +402,12 @@ async def launch_session_endpoint(
 
 @app.get("/sessions", response_model=GetSessionsResponse)
 async def get_sessions_endpoint(
-    x_user_id: str = Header(..., description="User ID to look up token from tokens.json"),
+    username: str = Header(..., description="User ID to look up token from tokens.json"),
     env: Environment = Query(..., description="Environment: Dev, UAT, or PROD"),
     project: Project = Query(..., description="Project: PROJECT1 or PROJECT2")
 ):
     """Get all sessions for a user"""
-    user_id, token = get_user_token(x_user_id)
+    username, token = get_user_token(username)
     base_url = get_base_url(env, project)
 
     try:
@@ -425,51 +443,17 @@ async def get_sessions_endpoint(
 @app.post("/stop-session", response_model=StopSessionResponse)
 async def stop_session_endpoint(
     request: StopSessionRequest,
-    x_user_id: str = Header(..., description="User ID to look up token from tokens.json")
+    username: str = Header(..., description="User ID to look up token from tokens.json")
 ):
-    """Stop/kill one or more sessions by session_ids or session_names"""
-    user_id, token = get_user_token(x_user_id)
+    """Stop/kill one or more sessions by session_ids"""
+    username, token = get_user_token(username)
     base_url = get_base_url(request.env, request.project)
 
-    # Validate that at least one of session_ids or session_names is provided
-    if not request.session_ids and not request.session_names:
-        raise HTTPException(
-            status_code=400,
-            detail="Either session_ids or session_names must be provided"
-        )
-
     try:
-        # If session_names are provided, first get all sessions to find the corresponding IDs
-        session_ids_to_stop = request.session_ids or []
-        
-        if request.session_names:
-            # Get all sessions to find the IDs for the given names
-            sessions_response = await get_sessions_api(base_url, token)
-            if sessions_response and "result" in sessions_response and "sessions" in sessions_response["result"]:
-                sessions = []
-                for session_data in sessions_response["result"]["sessions"]:
-                    session_info = extract_session_info(base_url, session_data)
-                    sessions.append(session_info)
-                
-                # Find session IDs by names
-                found_session_ids = find_session_ids_by_names(sessions, request.session_names)
-                session_ids_to_stop.extend(found_session_ids)
-            else:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Could not retrieve sessions to find session names"
-                )
-
-        if not session_ids_to_stop:
-            raise HTTPException(
-                status_code=400,
-                detail="No valid session IDs found to stop"
-            )
-
         response_data = await stop_session_api(
             base_url=base_url,
             token=token,
-            session_ids=session_ids_to_stop,
+            session_ids=request.session_ids,
             force_quit=request.force_quit,
             suspend_session=request.suspend_session
         )
@@ -477,8 +461,8 @@ async def stop_session_endpoint(
         if response_data:
             return StopSessionResponse(
                 success=True,
-                message=f"Successfully stopped {len(session_ids_to_stop)} sessions",
-                stopped_sessions=session_ids_to_stop
+                message=f"Successfully stopped {len(request.session_ids)} sessions",
+                stopped_sessions=request.session_ids
             )
         else:
             return StopSessionResponse(
