@@ -1,0 +1,85 @@
+async def launch_session_api(base_url: str, token: str, custom_session_name: Optional[str], workbench: str, cluster: str) -> tuple[dict, str]:
+    """Launch a session using the provided API with unique name"""
+    try:
+        sessions_response = await get_sessions_api(base_url, token)
+        existing_sessions = []
+        
+        if sessions_response and "result" in sessions_response and "sessions" in sessions_response["result"]:
+            for session_data in sessions_response["result"]["sessions"]:
+                session_info = extract_session_info(base_url, session_data)
+                existing_sessions.append(session_info)
+        
+        # Use custom session name if provided, otherwise generate one
+        if custom_session_name:
+            unique_session_name = custom_session_name
+        else:
+            next_number = get_next_available_session_number(existing_sessions)
+            unique_session_name = f"JupyterLab Session {next_number}"
+        
+    except Exception as e:
+        print(f"Error getting existing sessions, using simple naming: {e}")
+        unique_session_name = f"JupyterLab Session 1"
+    
+    payload = {
+        "method": "launch_session",
+        "kwparams": {
+            "workbench": workbench,
+            "name": unique_session_name,
+            "launch_parameters": {
+                "name": unique_session_name,
+                "cluster": cluster,
+                "placement_constraints": [],
+                "resource_limits": [],
+                "queues": []
+            }
+        }
+    }
+    
+    response_data = await make_api_request(base_url, LAUNCH_API, payload, token)
+    return response_data, unique_session_name
+
+@app.post("/launch-session", response_model=LaunchSessionResponse)
+async def launch_session_endpoint(
+    request: LaunchSessionRequest,
+    x_user_id: str = Header(..., description="User ID to look up token from tokens.json")
+):
+    """Launch a session with the provided parameters"""
+    user_id, token = get_user_token(x_user_id)
+    base_url = get_base_url(request.env, request.project)
+
+    try:
+        response_data, actual_session_name = await launch_session_api(
+            base_url=base_url,
+            token=token,
+            custom_session_name=request.session_name,
+            workbench=request.workbench,
+            cluster=request.cluster
+        )
+
+        if response_data and "result" in response_data and "url" in response_data["result"]:
+            formatted_base_url = format_base_url(base_url)
+            full_url = formatted_base_url + response_data["result"]["url"]
+            
+            return LaunchSessionResponse(
+                success=True,
+                message="Session launched successfully",
+                session_url=full_url,
+                session_name=actual_session_name
+            )
+        else:
+            return LaunchSessionResponse(
+                success=False,
+                message="Unexpected response format from external API",
+                error=str(response_data)
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        return LaunchSessionResponse(
+            success=False,
+            message="Failed to launch session",
+            error=str(e)
+        )
+
+        
