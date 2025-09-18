@@ -76,6 +76,11 @@ class UserAccessResponse(BaseModel):
     accessible_projects: Dict[str, List[str]]  # project -> list of environments
     has_access: bool
 
+class ReloadResponse(BaseModel):
+    success: bool
+    message: str
+    timestamp: str
+
 # API endpoints (relative paths)
 LAUNCH_API = "/api/launch_session"
 GET_SESSION_API = "/api/get_session"
@@ -163,14 +168,24 @@ def get_token_from_memory(project_name: str, env: Environment, username: str) ->
     
     return token
 
-def get_available_users_from_memory() -> List[str]:
-    """Get list of all available users from in-memory tokens data"""
+def get_available_users_from_memory(project: Optional[Project] = None, env: Optional[Environment] = None) -> List[str]:
+    """Get list of available users from in-memory tokens data with optional filtering"""
     try:
         tokens_data = load_tokens_data()
         
         users = set()
-        for project_data in tokens_data.values():
-            for env_data in project_data.values():
+        
+        # Filter by project if specified
+        projects_to_check = [project.value] if project else tokens_data.keys()
+        
+        for project_name in projects_to_check:
+            project_data = tokens_data.get(project_name, {})
+            
+            # Filter by environment if specified
+            envs_to_check = [env.value] if env else project_data.keys()
+            
+            for env_name in envs_to_check:
+                env_data = project_data.get(env_name, {})
                 users.update(env_data.keys())
         
         return sorted(list(users))
@@ -469,8 +484,20 @@ async def get_token(project: Project, env: Environment, username: str):
 
 @app.get("/available-users", response_model=AvailableUsersResponse)
 async def get_available_users_endpoint():
-    """Get list of available users from tokens file"""
+    """Get list of all available users from tokens file"""
     users = get_available_users_from_memory()
+    return AvailableUsersResponse(available_users=users)
+
+@app.get("/available-users/{project}", response_model=AvailableUsersResponse)
+async def get_available_users_by_project(project: Project):
+    """Get list of available users for a specific project"""
+    users = get_available_users_from_memory(project=project)
+    return AvailableUsersResponse(available_users=users)
+
+@app.get("/available-users/{project}/{env}", response_model=AvailableUsersResponse)
+async def get_available_users_by_project_env(project: Project, env: Environment):
+    """Get list of available users for a specific project and environment"""
+    users = get_available_users_from_memory(project=project, env=env)
     return AvailableUsersResponse(available_users=users)
 
 @app.get("/user-project-access/{username}", response_model=UserAccessResponse)
@@ -650,6 +677,31 @@ async def stop_session_endpoint(
             message="Failed to stop sessions",
             error=str(e)
         )
+@app.post("/admin/reload-tokens", response_model=ReloadResponse)
+async def reload_tokens():
+    """Reload tokens.json file"""
+    try:
+        load_tokens_data(force_reload=True)
+        return ReloadResponse(
+            success=True,
+            message="Tokens data reloaded successfully",
+            timestamp=datetime.now().isoformat()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to reload tokens: {e}")
+
+@app.post("/admin/reload-group-config", response_model=ReloadResponse)
+async def reload_group_config():
+    """Reload group_config.json file"""
+    try:
+        load_group_config(force_reload=True)
+        return ReloadResponse(
+            success=True,
+            message="Group configuration reloaded successfully",
+            timestamp=datetime.now().isoformat()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to reload group config: {e}")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
