@@ -1,0 +1,201 @@
+import os
+import requests
+import logging
+from typing import Dict, List, Any, Optional
+from cachetools import TTLCache
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+class GESClaimsService:
+    """
+    Service to fetch user claims from GES portal
+    """
+    
+    def __init__(self):
+        self.ges_base_url = os.getenv("GES_BASE_URL", "")
+        self.ges_client_id = os.getenv("GES_CLIENT_ID", "test")
+        self.ges_client_key = os.getenv("GES_CLIENT_KEY", "test123")
+        self.ges_enabled = bool(self.ges_base_url and self.ges_client_id and self.ges_client_key)
+        self.cache = TTLCache(maxsize=1000, ttl=300)  # 5-minute cache
+        
+    def get_user_claims(self, username: str, namespace: str = None) -> Dict[str, Any]:
+        """
+        Fetch user claims from GES portal
+        
+        Args:
+            username: The username to fetch claims for
+            namespace: The namespace (if not provided, uses default from env)
+        """
+        if not self.ges_enabled:
+            logger.warning("GES claims service is not enabled")
+            return {}
+        
+        # Use provided namespace or default from environment
+        namespace = namespace or os.getenv("GES_DEFAULT_NAMESPACE", "default")
+        
+        cache_key = f"claims_{namespace}_{username}"
+        if cache_key in self.cache:
+            logger.info(f"Returning cached claims for {username} in namespace {namespace}")
+            return self.cache[cache_key]
+        
+        try:
+            url = f"{self.ges_base_url}/Entitlements/{namespace}/{username}/Roles"
+            
+            headers = {
+                'X-GES-Client-Id': self.ges_client_id,
+                'X-GES-Client-Key': self.ges_client_key,
+                'Content-Type': 'application/json'
+            }
+            
+            logger.info(f"Fetching GES claims from: {url}")
+            response = requests.get(url, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                claims_data = response.json()
+                processed_claims = self._process_ges_claims(claims_data, username, namespace)
+                
+                # Cache the result
+                self.cache[cache_key] = processed_claims
+                logger.info(f"Successfully fetched GES claims for {username} in namespace {namespace}")
+                return processed_claims
+            else:
+                logger.error(f"GES API returned {response.status_code} for user {username}: {response.text}")
+                return {}
+                
+        except Exception as e:
+            logger.error(f"Error fetching GES claims for user {username}: {str(e)}")
+            return {}
+    
+    def _process_ges_claims(self, claims_data: Any, username: str, namespace: str) -> Dict[str, Any]:
+        """
+        Process raw GES claims data into standardized format
+        
+        Expected GES response format:
+        {
+            "roles": ["role1", "role2"],
+            "groups": ["group1", "group2"],
+            "permissions": ["perm1", "perm2"],
+            "attributes": {
+                "department": "IT",
+                "tier": "premium"
+            }
+        }
+        """
+        processed_claims = {
+            "ges_roles": [],
+            "ges_groups": [],
+            "ges_permissions": [],
+            "ges_attributes": {},
+            "ges_namespace": namespace,
+            "ges_source": "GES Portal"
+        }
+        
+        if isinstance(claims_data, dict):
+            # Extract roles
+            roles = claims_data.get('roles', [])
+            if isinstance(roles, list):
+                processed_claims["ges_roles"] = [role.lower() for role in roles if isinstance(role, str)]
+            
+            # Extract groups
+            groups = claims_data.get('groups', [])
+            if isinstance(groups, list):
+                processed_claims["ges_groups"] = [group.lower() for group in groups if isinstance(group, str)]
+            
+            # Extract permissions
+            permissions = claims_data.get('permissions', [])
+            if isinstance(permissions, list):
+                processed_claims["ges_permissions"] = [perm.lower() for perm in permissions if isinstance(perm, str)]
+            
+            # Extract attributes
+            attributes = claims_data.get('attributes', {})
+            if isinstance(attributes, dict):
+                processed_claims["ges_attributes"] = attributes
+            
+            # Extract any other top-level fields
+            for key, value in claims_data.items():
+                if key not in ['roles', 'groups', 'permissions', 'attributes']:
+                    processed_claims[f"ges_{key}"] = value
+        
+        elif isinstance(claims_data, list):
+            # If response is a simple list of roles
+            processed_claims["ges_roles"] = [item.lower() for item in claims_data if isinstance(item, str)]
+        
+        # Add derived claims based on roles/groups
+        processed_claims.update(self._derive_claims(processed_claims))
+        
+        return processed_claims
+    
+    def _derive_claims(self, ges_claims: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Derive additional claims based on GES roles and groups
+        """
+        derived_claims = {}
+        
+        roles = ges_claims.get("ges_roles", [])
+        groups = ges_claims.get("ges_groups", [])
+        
+        # Determine if user is admin
+        is_admin = any(role in ['admin', 'administrator'] for role in roles) or \
+                  any(group in ['admins', 'administrators'] for group in groups)
+        
+        if is_admin:
+            derived_claims["is_admin"] = True
+            derived_claims["max_rate_limit"] = 1000
+            derived_claims["tier"] = "premium"
+        
+        # Determine team based on groups
+        team_mapping = {
+            'ai-team': 'ai-team',
+            'ml-team': 'ml-team', 
+            'data-science': 'ds-team',
+            'developers': 'dev-team'
+        }
+        
+        for group in groups:
+            if group in team_mapping:
+                derived_claims["team"] = team_mapping[group]
+                break
+        else:
+            derived_claims["team"] = "general-users"
+        
+        # Set tier based on roles
+        if any(role in ['premium', 'vip'] for role in roles):
+            derived_claims["tier"] = "premium"
+            derived_claims["max_rate_limit"] = 100
+        elif any(role in ['standard', 'user'] for role in roles):
+            derived_claims["tier"] = "standard" 
+            derived_claims["max_rate_limit"] = 50
+        else:
+            derived_claims["tier"] = "basic"
+            derived_claims["max_rate_limit"] = 20
+        
+        return derived_claims
+    
+    def validate_ges_access(self, username: str, required_role: str = None, 
+                          required_group: str = None, namespace: str = None) -> Dict[str, Any]:
+        """
+        Validate if user has specific role or group in GES
+        """
+        claims = self.get_user_claims(username, namespace)
+        
+        validation_result = {
+            "has_access": False,
+            "user_claims": claims,
+            "required_role": required_role,
+            "required_group": required_group
+        }
+        
+        if required_role:
+            user_roles = claims.get("ges_roles", [])
+            validation_result["has_access"] = required_role.lower() in [r.lower() for r in user_roles]
+            validation_result["reason"] = f"Role '{required_role}' {'found' if validation_result['has_access'] else 'not found'}"
+        
+        elif required_group:
+            user_groups = claims.get("ges_groups", [])
+            validation_result["has_access"] = required_group.lower() in [g.lower() for g in user_groups]
+            validation_result["reason"] = f"Group '{required_group}' {'found' if validation_result['has_access'] else 'not found'}"
+        
+        return validation_result
