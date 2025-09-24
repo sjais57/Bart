@@ -1,0 +1,289 @@
+# Add this import at the top
+from ges_claims_service import GESClaimsService
+
+# Initialize GES Claims Service after other components
+ges_claims_service = GESClaimsService()
+
+# Update the check_pre_validation function to support GES claims
+def check_pre_validation(api_key: str, username: str, use_ges: bool = False, namespace: str = None) -> dict:
+    """
+    Check if the user meets the pre-validation requirements
+    Supports both AD groups and GES claims
+    """
+    try:
+        # Load the API key configuration
+        api_keys_dir = os.getenv("API_KEYS_DIR", "config/api_keys")
+        api_key_file = os.path.join(api_keys_dir, f"{api_key}.yaml")
+        
+        if not os.path.exists(api_key_file):
+            return {
+                "valid": False,
+                "message": "Invalid API key"
+            }
+        
+        with open(api_key_file, 'r') as f:
+            api_key_config = yaml.safe_load(f)
+        
+        # Check if pre_validation_check is configured
+        pre_validation = api_key_config.get('pre_validation_check', {})
+        required_group = pre_validation.get('group')
+        required_ges_role = pre_validation.get('ges_role')
+        required_ges_group = pre_validation.get('ges_group')
+        
+        if not any([required_group, required_ges_role, required_ges_group]):
+            # No pre-validation required
+            return {
+                "valid": True,
+                "message": "No pre-validation required"
+            }
+        
+        # Use GES claims if specified or if no AD group requirement
+        if use_ges or required_ges_role or required_ges_group:
+            validation_result = ges_claims_service.validate_ges_access(
+                username, required_ges_role, required_ges_group, namespace
+            )
+            
+            if validation_result["has_access"]:
+                return {
+                    "valid": True,
+                    "message": f"User has required GES access",
+                    "validation_source": "GES",
+                    "user_ges_claims": validation_result["user_claims"]
+                }
+            else:
+                return {
+                    "valid": False,
+                    "message": validation_result.get("reason", "GES validation failed"),
+                    "validation_source": "GES",
+                    "required_ges_role": required_ges_role,
+                    "required_ges_group": required_ges_group,
+                    "user_ges_claims": validation_result["user_claims"]
+                }
+        else:
+            # Use traditional AD groups (your existing logic)
+            # This part would need the normalized_groups parameter
+            # You'll need to modify the function call to provide groups
+            return {
+                "valid": False,
+                "message": "AD group validation requires groups parameter"
+            }
+            
+    except Exception as e:
+        logger.error(f"Error during pre-validation check: {str(e)}")
+        return {
+            "valid": False,
+            "message": f"Error during validation: {str(e)}"
+        }
+
+
+
+@app.route('/token', methods=['POST'])
+def login():
+    if not request.is_json:
+        return jsonify({"error": "Missing JSON in request"}), 400
+
+    username = request.json.get('username', None)
+    password = request.json.get('password', None)
+    api_key = request.json.get('api_key', None)
+    custom_secret = request.json.get('secret', None)
+    use_ges_claims = request.json.get('use_ges_claims', False)  # New parameter
+    ges_namespace = request.json.get('ges_namespace', None)     # New parameter
+
+    if not username or not password:
+        return jsonify({"error": "Missing username or password"}), 400
+
+    # Authenticate based on the configured method
+    if AUTH_METHOD == "ldap":
+        authenticated, user_data = authenticate_ldap(username, password)
+    else:  # file-based authentication
+        authenticated, user_data = authenticate_file(username, password)
+
+    if not authenticated:
+        error_message = "Invalid username or password"
+        if "error" in user_data:
+            error_message = user_data["error"]
+        return jsonify({"error": error_message}), 401
+    
+    raw_groups = user_data.get("groups", [])
+    normalized_groups = extract_group_cn(raw_groups)
+
+    # Create user context for dynamic claims processing
+    user_context = {
+        "user_id": username,
+        "email": user_data.get("email", ""),
+        "groups": normalized_groups,
+        "roles": user_data.get("roles", []),
+        "team_id": get_team_id_from_user(username, user_data),
+        "use_ges_claims": use_ges_claims,      # Add GES flags to context
+        "ges_namespace": ges_namespace
+    }
+
+    # If an API key was provided, check pre-validation and get additional claims
+    if api_key:
+        # Check pre-validation (support both AD groups and GES claims)
+        validation_result = check_pre_validation(api_key, username, use_ges_claims, ges_namespace)
+        if not validation_result["valid"]:
+            return jsonify({
+                "error": validation_result["message"],
+                "validation_source": validation_result.get("validation_source", "AD"),
+                "required_group": validation_result.get("required_group"),
+                "required_ges_role": validation_result.get("required_ges_role"),
+                "required_ges_group": validation_result.get("required_ges_group")
+            }), 403
+        
+        # Create a proper user context for dynamic claims
+        user_context = {
+            "user_id": username,
+            "team_id": get_team_id_from_user(username, user_data),
+            "groups": normalized_groups,
+            "api_key_id": api_key,
+            "use_ges_claims": use_ges_claims,      # Pass GES flags
+            "ges_namespace": ges_namespace
+        }
+        logger.info(f"Processing API key with user_context: {user_context}")
+        api_key_claims = get_additional_claims(api_key, user_context)
+    else:
+        api_key_claims = get_additional_claims(None, user_context)
+
+    # Log which API key is being used
+    if api_key:
+        logger.info(f"Using provided API key: {api_key}")
+    else:
+        logger.info("No API key provided, using base API key")
+
+    # Merge user data with additional claims
+    claims = {**user_data, **api_key_claims}
+    
+    # Get expiration time from API key configuration if available
+    expires_delta = app.config["JWT_ACCESS_TOKEN_EXPIRES"]  # Default
+    if 'exp_hours' in claims:
+        expires_delta = timedelta(hours=claims['exp_hours'])
+        logger.info(f"Using custom expiration time from API key: {claims['exp_hours']} hours")
+        # Remove exp_hours from claims to avoid conflicts
+        claims.pop('exp_hours')
+    
+    # If custom secret is provided, use it with PyJWT directly instead of flask_jwt_extended
+    if custom_secret:
+        # [Keep your existing custom secret logic...]
+        # ... (your existing custom secret code remains the same)
+    else:
+        # Standard token creation with application secret
+        access_token = create_access_token(
+            identity=username, 
+            additional_claims=claims,
+            expires_delta=expires_delta,
+            fresh=True
+        )
+        refresh_token = create_refresh_token(identity=username, additional_claims=claims)
+        
+        return jsonify(access_token=access_token, refresh_token=refresh_token), 200
+
+
+utils/api_key.py:
+def get_additional_claims(api_key: str, user_context: dict) -> dict:
+    """
+    Get additional claims based on API key configuration and user context
+    Now supports both AD groups and GES claims
+    """
+    try:
+        base_claims = get_base_claims()
+        
+        if not api_key:
+            return base_claims
+        
+        # Load API key configuration
+        api_keys_dir = os.getenv("API_KEYS_DIR", "config/api_keys")
+        api_key_file = os.path.join(api_keys_dir, f"{api_key}.yaml")
+        
+        if not os.path.exists(api_key_file):
+            logger.warning(f"API key file not found: {api_key_file}")
+            return base_claims
+        
+        with open(api_key_file, 'r') as f:
+            api_key_config = yaml.safe_load(f)
+        
+        claims_config = api_key_config.get('claims', {})
+        static_claims = claims_config.get('static', {})
+        dynamic_config = claims_config.get('dynamic', {})
+        
+        # Check if we should use GES claims
+        use_ges_claims = user_context.get('use_ges_claims', False)
+        ges_namespace = user_context.get('ges_namespace')
+        
+        if use_ges_claims:
+            # Get claims from GES
+            ges_claims = ges_claims_service.get_user_claims(
+                user_context['user_id'], 
+                ges_namespace
+            )
+            
+            # Apply GES-based dynamic claims
+            dynamic_claims = apply_ges_dynamic_claims(dynamic_config, ges_claims)
+        else:
+            # Use traditional AD group-based claims
+            user_groups = user_context.get('groups', [])
+            dynamic_claims = apply_group_dynamic_claims(dynamic_config, user_groups)
+        
+        # Merge all claims
+        final_claims = {**base_claims, **static_claims, **dynamic_claims}
+        
+        # Add metadata
+        final_claims['api_key_id'] = api_key
+        if use_ges_claims:
+            final_claims['claims_source'] = 'GES'
+            final_claims['ges_namespace'] = ges_namespace
+        else:
+            final_claims['claims_source'] = 'AD'
+        
+        return final_claims
+            
+    except Exception as e:
+        logger.error(f"Error getting additional claims: {str(e)}")
+        return get_base_claims()
+
+def apply_ges_dynamic_claims(dynamic_config: dict, ges_claims: dict) -> dict:
+    """
+    Apply dynamic claims based on GES roles and groups
+    """
+    dynamic_claims = {}
+    
+    # Get GES roles and groups
+    ges_roles = ges_claims.get('ges_roles', [])
+    ges_groups = ges_claims.get('ges_groups', [])
+    
+    # Apply role-based claims
+    role_claims = dynamic_config.get('role_claims', {})
+    for role in ges_roles:
+        if role in role_claims:
+            dynamic_claims.update(role_claims[role])
+    
+    # Apply group-based claims
+    group_claims = dynamic_config.get('group_claims', {})
+    for group in ges_groups:
+        if group in group_claims:
+            dynamic_claims.update(group_claims[group])
+    
+    # Apply default claims if no specific claims matched
+    if not dynamic_claims:
+        default_claims = dynamic_config.get('default_claims', {})
+        dynamic_claims.update(default_claims)
+    
+    return dynamic_claims
+
+def apply_group_dynamic_claims(dynamic_config: dict, user_groups: list) -> dict:
+    """
+    Apply dynamic claims based on AD groups (your existing logic)
+    """
+    # Your existing group-based claims logic here
+    dynamic_claims = {}
+    group_claims = dynamic_config.get('group_claims', {})
+    default_claims = dynamic_config.get('default_claims', {})
+    
+    for group in user_groups:
+        if group in group_claims:
+            dynamic_claims.update(group_claims[group])
+    
+    if not dynamic_claims and default_claims:
+        dynamic_claims.update(default_claims)
+    
+    return dynamic_claims
