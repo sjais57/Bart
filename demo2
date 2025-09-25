@@ -1,3 +1,14 @@
+"Welcome to the DSP AI Control Tower - 
+a centralized policy-driven orchestration platform that standardizes AI/ML deployments across hybrid environments. 
+Think of it as an air traffic control system for your AI infrastructure, ensuring security, compliance, and efficiency through declarative policies and automated governance."
+
+
+Real-time policy evaluation with OPA integration
+
+Client authentication via headers
+
+Role-based access control
+
 Pitch: "This is our mission control center - from here we can manage policies, monitor access, and deploy AI workloads securely."
 
   Pitch: "See how we can instantly check what policies apply to any user or team - essential for compliance audits and access reviews."
