@@ -1,0 +1,80 @@
+“Good [morning/afternoon], everyone.
+Today, I’m excited to introduce Control Tower—a FastAPI-based service designed to give a unified view of our policy landscape.
+With Control Tower, you can:
+1️⃣ Retrieve all available policies,
+2️⃣ Check which policies a specific user has access to, and
+3️⃣ Explore every available endpoint with its details.
+
+I’ll start with a quick look at the architecture and the key design choices that make it fast and scalable, and then we’ll move into a live demonstration of these features in action.”
+
+
+  "Good morning/afternoon everyone! Today I'm excited to showcase our DSP AI Control Tower - a centralized policy management and governance platform that brings enterprise-grade security and automation to our AI infrastructure.
+
+Think of this as air traffic control for your AI operations - it ensures safe, compliant, and efficient management of AI workloads across our entire ecosystem."
+
+🚀 Key Value Propositions to Highlight
+1. Centralized Policy Governance
+"One platform to manage all AI access controls and compliance policies"
+
+"Rego-based policy engine for fine-grained authorization decisions"
+
+"Real-time policy evaluation for Jupyter Labs, model deployments, and API access"
+
+2. Multi-Tenant Security
+"Secure client isolation with hashed secrets and salt-based authentication"
+
+"Role-based access control for users and groups"
+
+"Superuser oversight with audit trails"
+
+3. HPC Integration Ready
+"Automated Slurm job template generation for AI workloads"
+
+"Environment-specific configurations (dev/staging/prod)"
+
+"GPU resource management and quota enforcement"
+
+
+  Pitch: "Our manifest system ensures every AI project follows standardized patterns with proper cross-module dependencies and security controls."
+
+
+  Key Talking Points
+Problem We Solve
+"AI infrastructure is complex and security is often an afterthought"
+
+"Teams struggle with consistent access controls across different environments"
+
+"Compliance requirements are difficult to enforce at scale"
+
+Our Solution
+"Policy as Code": All security rules are version-controlled and testable
+
+"Shift Left Security": Policies are evaluated before deployment, not after
+
+"Developer Self-Service": Teams can safely deploy within guardrails
+
+"Audit Ready": Complete visibility into who can do what, when, and why"
+
+Technical Highlights
+"FastAPI for high-performance async operations"
+
+"Open Policy Agent (OPA) integration for enterprise-grade policy engine"
+
+"JWT-based authentication with secure secret management"
+
+"Modular architecture that scales from single team to entire organization"
+
+💡 Demo Closing
+"As you've seen, the Control Tower transforms AI governance from a bottleneck into an enabler. We're not just preventing bad things - we're making it easier to do the right things securely.
+
+Key takeaways:
+
+✅ Centralized policy management
+
+✅ Real-time authorization
+
+✅ Automated compliance
+
+✅ Developer productivity
+
+This platform currently manages [X] policies, [Y] users, and [Z] AI projects across our organization, ensuring that our AI innovation moves fast but never breaks things."
